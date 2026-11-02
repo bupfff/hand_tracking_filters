@@ -78,6 +78,7 @@
     #dots { display: flex; gap: 4px; }
     #dots span { width: 5px; height: 5px; border-radius: 50%; background: rgba(255,255,255,.3); transition: background .2s, transform .2s; }
     #dots span.on { background: var(--accent); transform: scale(1.5); }
+    #dots span.band { background: var(--accent); }
 
     #tune {
       position: relative; width: 48px; height: 4px; border-radius: 2px;
@@ -90,14 +91,14 @@
     }
     #tune i { position: absolute; top: 0; bottom: 0; border-radius: 2px; background: var(--accent); }
 
-    #hint, #status, #frozen {
+    #hint, #status, #stamps {
       max-width: min(90vw, 28rem); text-align: center;
       padding: 8px 14px; border-radius: 12px;
       background: var(--glass); color: var(--muted); font-size: .9rem; line-height: 1.4;
       backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
       transition: opacity .3s;
     }
-    #frozen { color: var(--ice); pointer-events: auto; cursor: pointer; }
+    #stamps { color: var(--ice); pointer-events: auto; cursor: pointer; }
     #status.error { color: var(--error); }
     #debug {
       position: fixed; top: calc(12px + env(safe-area-inset-top, 0px)); left: 12px;
@@ -120,10 +121,11 @@
       <h1>Portal filters</h1>
       <p>Hold up both hands with your index fingers and thumbs out. A portal opens between them.</p>
       <ul class="gestures">
-        <li><b>Pinch to switch.</b> Bring all four fingertips together in the middle.</li>
+        <li><b>Spread for more.</b> Put out more fingers and every gap between matching fingers becomes its own portal, each with the next filter along. Curl them back in for one portal.</li>
+        <li><b>Pinch to switch.</b> Bring all four fingertips together in the middle. With more fingers out, just touch your fingertips together.</li>
         <li><b>Swipe to go back.</b> Flick the portal right for the previous filter, left for the next. The arrow buttons work too.</li>
         <li><b>Tilt to tune.</b> Raise one hand above the other to dial the filter up or down.</li>
-        <li><b>Fist to freeze.</b> Hold a still fist to pin the portal in place. Do it again, or tap the banner, to release.</li>
+        <li><b>Fist to stamp.</b> Hold a still fist to pin a copy of the portal in place. The live one keeps following your hands, so you can stamp a few around the room. Tap the banner or press C to clear them, or Backspace to remove the last one.</li>
       </ul>
       <button id="start">Start camera</button>
       <div id="intro-status" role="status"></div>
@@ -132,7 +134,7 @@
 
   <div id="hud" hidden>
     <div id="hint" class="gone">Hold up both hands, index and thumb out</div>
-    <div id="frozen" hidden role="button">Frozen. Make a fist or tap here to release.</div>
+    <div id="stamps" hidden role="button"></div>
     <div id="status" hidden role="status"></div>
     <div id="chip">
       <button class="nav" id="prev" aria-label="Previous filter">‹</button>
@@ -162,6 +164,7 @@
 
     // Pinch: all four fingertips together. "close" = the larger of the portal's
     // width and height, so pinching each hand on its own (width stays big) is ignored.
+    // With extra bands showing, "close" is the width alone: touch fingertips to switch.
     const CLOSE_AT      = 0.55;
     const REOPEN_AT     = 1.00;
     const LOSS_CLOSE_AT = 0.80;   // hands vanished while closing in below this -> counts
@@ -173,7 +176,15 @@
     const FIST_HOLD_MS   = 400;
     const FIST_MAX_MOVE  = 0.4;   // palm lengths the fist may drift during the hold (blocks motion-blur false fists)
     const FIST_RELEASE_MS = 150;
-    const INDEX_EXTENDED = 1.30;  // both indexes above this = clean portal pose (used for freezing)
+    const MAX_STAMPS     = 6;     // stamps kept on screen; the oldest drops off past this
+    const EXTENDED       = 1.30;  // a finger above this on each hand = clean portal pose (used for freezing)
+
+    // Bands: band k sits between finger k and k+1 (thumb–index, index–middle,
+    // middle–ring, ring–pinky) on both hands. Band 0 is the original portal and is
+    // always on; the others turn on when both of their fingers are out on both hands.
+    const FINGER_OUT_AT = 1.30;   // same ratio as the fist check: above this a finger counts as out
+    const FINGER_IN_AT  = 1.15;   // ...and below this it counts as tucked away again
+    const BAND_TAU      = 0.08;
 
     // Swipe
     const SWIPE_WINDOW_MS   = 300;
@@ -203,8 +214,13 @@
     FILTERS.forEach(() => dotsEl.appendChild(document.createElement("span")));
 
     function showFilter() {
-      $("filterName").textContent = FILTERS[filterIdx];
-      [...dotsEl.children].forEach((d, i) => d.classList.toggle("on", i === filterIdx));
+      const extra = bandOn.filter(Boolean).length - 1;
+      const lit = bandOn.map((on, k) => (on ? (filterIdx + k) % FILTERS.length : -1));
+      $("filterName").textContent = FILTERS[filterIdx] + (extra > 0 ? ` +${extra}` : "");
+      [...dotsEl.children].forEach((d, i) => {
+        d.classList.toggle("on", i === filterIdx);
+        d.classList.toggle("band", i !== filterIdx && lit.includes(i));
+      });
     }
     function introStatus(msg, isError = false) {
       const el = $("intro-status");
@@ -224,13 +240,18 @@
       bar.style.width = Math.abs(pct - 50) + "%";
       $("tune").classList.toggle("gone", !visible);
     }
+    function showStamps() {
+      const n = stamps.length;
+      $("stamps").hidden = n === 0;
+      $("stamps").textContent = `${n} stamp${n === 1 ? "" : "s"}. Tap here to clear.`;
+    }
 
     // ================= State =================
     let filterIdx = 0, prevFilter = 0, trans = 1, transDir = [0, 0];
     let landmarker = null, trackingReady = false, startedAt = 0;
     let lastVideoTime = -1;
 
-    let tracked = null;           // One-Euro-filtered corners, mirrored camera px: [L index, L thumb, R index, R thumb]
+    let tracked = null;           // One-Euro-filtered fingertips, mirrored camera px: [left hand, right hand], each [thumb, index, middle, ring, pinky]
     let display = null;           // eased copy of `tracked`, updated every render frame
     let lastBoth = -Infinity;     // last time both hands were seen
     let lastAny = -Infinity;      // last time the portal got any update (incl. one-hand bridging)
@@ -246,8 +267,13 @@
 
     // Fist / freeze
     let fistSince = null, fistAnchor = null, notFistSince = null, fistLatched = false, fistNow = false;
-    let freezeRequest = false, frozen = false, frozenQuad = null, frozenTune = 0.5;
-    let poseGood = false, goodQuad = null, goodAt = -Infinity, goodTune = 0.5;
+    let stampRequest = false, stamps = [];   // each stamp: { tex, pts, bands, tune, filter }
+    let poseGood = false, goodPts = null, goodBands = null, goodAt = -Infinity, goodTune = 0.5;
+
+    // Bands
+    const allTucked = () => [[false, false, false, false], [false, false, false, false]];
+    let fingerOut = allTucked();  // [left, right] × [index, middle, ring, pinky]
+    let bandOn = [true, false, false, false], bandAlpha = [1, 0, 0, 0], shownBands = "";
 
     // Swipe
     let swipeHistory = [], lastSwipe = -Infinity;
@@ -260,7 +286,7 @@
 
     // Debug
     let showDebug = false, detectCount = 0, detectFps = 30, fpsWindowStart = 0;
-    let handsSeen = 0, indexCurls = [];
+    let handsSeen = 0, handCurls = [];
 
     function switchFilter(step = 1, dir = [0, 0]) {
       prevFilter = filterIdx;
@@ -271,11 +297,13 @@
     }
     $("prev").addEventListener("click", () => switchFilter(-1, [1, 0]));
     $("next").addEventListener("click", () => switchFilter(1, [-1, 0]));
-    $("frozen").addEventListener("click", () => { if (frozen) freezeRequest = true; });
+    $("stamps").addEventListener("click", () => dropStamps(true));
     addEventListener("keydown", (e) => {
       if (e.key === "ArrowRight" || e.key === " ") { switchFilter(1, [-1, 0]); e.preventDefault(); }
       if (e.key === "ArrowLeft") switchFilter(-1, [1, 0]);
-      if (e.key === "f" || e.key === "F") freezeRequest = true;
+      if (e.key === "f" || e.key === "F") stampRequest = true;
+      if (e.key === "c" || e.key === "C") dropStamps(true);
+      if (e.key === "Backspace") dropStamps(false);
       if (e.key === "d" || e.key === "D") { showDebug = !showDebug; $("debug").hidden = !showDebug; }
     });
 
@@ -297,7 +325,7 @@
         return this.x;
       }
     }
-    const euro = Array.from({ length: 8 }, () => new OneEuro(MIN_CUTOFF, BETA));
+    const euro = Array.from({ length: 20 }, () => new OneEuro(MIN_CUTOFF, BETA));   // 2 hands × 5 tips × x/y
 
     // ================= Hand tracking =================
     async function createLandmarker() {
@@ -347,14 +375,17 @@
       return boosted;
     }
 
-    const WRIST = 0, THUMB_TIP = 4, INDEX_TIP = 8, MIDDLE_MCP = 9;
+    const WRIST = 0, MIDDLE_MCP = 9;
+    const TIPS = [4, 8, 12, 16, 20];   // thumb, index, middle, ring, pinky
+    const THUMB = 0, INDEX = 1;        // positions in TIPS
     const FINGERS = [[8, 5], [12, 9], [16, 13], [20, 17]];
     const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
-    const cloneQuad = (q) => q.map((p) => [...p]);
+    const cloneHands = (hs) => hs.map((h) => h.map((p) => [...p]));
 
-    function updateCorners(ids, pts, t) {
-      ids.forEach((c, j) => {
-        tracked[c] = [euro[c * 2].filter(pts[j][0], t), euro[c * 2 + 1].filter(pts[j][1], t)];
+    function updateHand(side, tips, t) {
+      tips.forEach((p, f) => {
+        const e = (side * 5 + f) * 2;
+        tracked[side][f] = [euro[e].filter(p[0], t), euro[e + 1].filter(p[1], t)];
       });
     }
 
@@ -368,13 +399,14 @@
         const w = toPx(lm[WRIST]);
         const palm = Math.max(dist(w, toPx(lm[MIDDLE_MCP])), 1);
         const curls = FINGERS.map(([tip, mcp]) => dist(toPx(lm[tip]), w) / Math.max(dist(toPx(lm[mcp]), w), 1));
+        const tips = TIPS.map((i) => toPx(lm[i]));
         return {
-          w, palm, index: curls[0],
+          w, palm, curls,
           fist: curls[0] < FIST_INDEX && curls.slice(1).every((c) => c < FIST_OTHERS),
-          idx: toPx(lm[INDEX_TIP]), thumb: toPx(lm[THUMB_TIP]),
+          tips, idx: tips[INDEX], thumb: tips[THUMB],
         };
       });
-      indexCurls = info.map((i) => i.index);
+      handCurls = info.map((i) => i.curls);
       updateFist(info.filter((i) => i.fist), now);
 
       if (info.length < 2) {
@@ -390,40 +422,50 @@
 
       // Hands touching: keep whichever left/right assignment matches last frame.
       if (recent && Math.abs(L.w[0] - R.w[0]) < palm) {
-        const cost = (l, r) => dist(l.idx, tracked[0]) + dist(r.idx, tracked[2]);
+        const cost = (l, r) => dist(l.idx, tracked[0][INDEX]) + dist(r.idx, tracked[1][INDEX]);
         if (cost(R, L) < cost(L, R)) [L, R] = [R, L];
       }
 
-      const raw = [L.idx, L.thumb, R.idx, R.thumb];
+      const raw = [L.tips, R.tips];
       if (!recent) {
         euro.forEach((f) => f.reset());
         swipeHistory = [];
-        tracked = cloneQuad(raw);
+        fingerOut = allTucked();
+        tracked = cloneHands(raw);
       }
-      updateCorners([0, 1, 2, 3], raw, t);
-      if (!recent || !display) display = cloneQuad(tracked);
+      updateHand(0, raw[0], t);
+      updateHand(1, raw[1], t);
+      if (!recent || !display) display = cloneHands(tracked);
+
+      // ---- Bands: each needs both of its fingers out on both hands.
+      [L, R].forEach((h, s) => h.curls.forEach((c, f) => {
+        if (c > FINGER_OUT_AT) fingerOut[s][f] = true;
+        else if (c < FINGER_IN_AT) fingerOut[s][f] = false;
+      }));
+      for (let k = 1; k < 4; k++) bandOn[k] = fingerOut.every((out) => out[k - 1] && out[k]);
 
       const wasLost = inLoss, lossDur = now - lossStart;
       inLoss = false;
       lastBoth = lastAny = now;
       lastPalm = palm;
 
-      // Gesture measurements use raw points: no smoothing lag.
-      const width  = (dist(raw[0], raw[2]) + dist(raw[1], raw[3])) / 2 / palm;
-      const height = (dist(raw[0], raw[1]) + dist(raw[2], raw[3])) / 2 / palm;
+      // Gesture measurements use raw points (the thumb–index portal): no smoothing lag.
+      const [Lt, Rt] = raw;
+      const width  = (dist(Lt[INDEX], Rt[INDEX]) + dist(Lt[THUMB], Rt[THUMB])) / 2 / palm;
+      const height = (dist(Lt[INDEX], Lt[THUMB]) + dist(Rt[INDEX], Rt[THUMB])) / 2 / palm;
       prevClose = close;
-      close = Math.max(width, height);
+      close = bandOn.some((on, k) => on && k > 0) ? width : Math.max(width, height);
       closeAt = now;
-      const cx = (raw[0][0] + raw[1][0] + raw[2][0] + raw[3][0]) / 4;
-      const cy = (raw[0][1] + raw[1][1] + raw[2][1] + raw[3][1]) / 4;
+      const cx = (Lt[INDEX][0] + Lt[THUMB][0] + Rt[INDEX][0] + Rt[THUMB][0]) / 4;
+      const cy = (Lt[INDEX][1] + Lt[THUMB][1] + Rt[INDEX][1] + Rt[THUMB][1]) / 4;
 
-      if (frozen) { swipeHistory = []; poseGood = false; return; }
-      poseGood = L.index > INDEX_EXTENDED && R.index > INDEX_EXTENDED && width > 1.2;
+      poseGood = Math.max(...L.curls) > EXTENDED && Math.max(...R.curls) > EXTENDED && width > 1.2;
 
       // ---- Tilt (smoothed points; ignored when the portal is too narrow to have a clear angle)
       if (width > 1) {
-        const vx = (tracked[2][0] - tracked[0][0]) + (tracked[3][0] - tracked[1][0]);
-        const vy = (tracked[2][1] - tracked[0][1]) + (tracked[3][1] - tracked[1][1]);
+        const [Ls, Rs] = tracked;
+        const vx = (Rs[INDEX][0] - Ls[INDEX][0]) + (Rs[THUMB][0] - Ls[THUMB][0]);
+        const vy = (Rs[INDEX][1] - Ls[INDEX][1]) + (Rs[THUMB][1] - Ls[THUMB][1]);
         tiltDeg = Math.atan2(-vy, vx) * 180 / Math.PI;
         const past = Math.max(0, Math.abs(tiltDeg) - TILT_DEADZONE) * Math.sign(tiltDeg);
         targetTune = Math.min(1, Math.max(0, 0.5 + 0.5 * past / TILT_RANGE));
@@ -462,13 +504,13 @@
     }
 
     // One hand dropped out (usually motion blur): keep the portal alive by moving
-    // the visible hand's corners and holding the missing hand's corners in place.
+    // the visible hand's fingertips and holding the missing hand's in place.
     function bridgeOneHand(h, now, t) {
       if (!tracked || now - lastBoth > BRIDGE_MS) return;
-      const dL = dist(h.idx, tracked[0]) + dist(h.thumb, tracked[1]);
-      const dR = dist(h.idx, tracked[2]) + dist(h.thumb, tracked[3]);
+      const dL = dist(h.idx, tracked[0][INDEX]) + dist(h.thumb, tracked[0][THUMB]);
+      const dR = dist(h.idx, tracked[1][INDEX]) + dist(h.thumb, tracked[1][THUMB]);
       if (Math.min(dL, dR) / 2 > 3 * lastPalm) return;   // too far away to be the same hand
-      updateCorners(dL <= dR ? [0, 1] : [2, 3], [h.idx, h.thumb], t);
+      updateHand(dL <= dR ? 0 : 1, h.tips, t);
       lastAny = now;
     }
 
@@ -477,7 +519,7 @@
       if (inLoss) return;
       inLoss = true; lossStart = now; swipedThisLoss = false;
       preLossCenter = swipeHistory.length ? swipeHistory[swipeHistory.length - 1] : null;
-      if (frozen || !tracked || now - closeAt > 250) return;
+      if (!tracked || now - closeAt > 250) return;
 
       // Pressing four fingertips together often makes MediaPipe drop a hand
       // before "close" gets under the threshold. Closing in + lost = pinch.
@@ -513,7 +555,7 @@
         if (fistSince === null || dist(h.w, fistAnchor) / h.palm > FIST_MAX_MOVE) {
           fistSince = now; fistAnchor = h.w;
         }
-        if (!fistLatched && now - fistSince >= FIST_HOLD_MS) { fistLatched = true; freezeRequest = true; }
+        if (!fistLatched && now - fistSince >= FIST_HOLD_MS) { fistLatched = true; stampRequest = true; }
       } else {
         fistSince = null; fistAnchor = null;
         if (fistLatched) {
@@ -536,10 +578,12 @@
       uniform sampler2D uVideo;
       uniform sampler2D uFrozen;
       uniform int   uUseFrozen;
+      uniform int   uBase;        // 1 = draw the live camera; 0 = draw one portal as a layer on top
       uniform vec2  uRes;
       uniform vec4  uCover;
-      uniform vec2  uQuad[4];
-      uniform vec4  uBox;
+      uniform vec2  uPts[10];     // fingertips: left thumb..pinky, then right thumb..pinky
+      uniform vec4  uBox[4];      // bounding box of each band
+      uniform float uBand[4];     // opacity of each band; band k spans fingers k and k+1
       uniform float uAlpha;
       uniform int   uFilter;
       uniform int   uPrevFilter;
@@ -552,7 +596,9 @@
       uniform vec3  uOutline;
       out vec4 outColor;
 
+      const int NUM_FILTERS = ${FILTERS.length};
       bool gFrozen = false;
+      vec4 gBox;                  // bounding box of the band being filtered
 
       vec3 cam(vec2 p) {
         vec2 uv = (p - uCover.xy) / uCover.zw;
@@ -567,10 +613,10 @@
       }
       vec3 rgb(int r, int g, int b) { return vec3(r, g, b) / 255.0; }
 
-      bool inQuad(vec2 p) {
+      bool inQuad(vec2 p, vec2 q[4]) {
         bool inside = false;
         for (int i = 0; i < 4; i++) {
-          vec2 a = uQuad[i], b = uQuad[(i + 3) % 4];
+          vec2 a = q[i], b = q[(i + 3) % 4];
           if ((a.y > p.y) != (b.y > p.y) &&
               p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x) inside = !inside;
         }
@@ -581,9 +627,9 @@
         float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-4), 0.0, 1.0);
         return length(pa - ba * h);
       }
-      float edgeDist(vec2 p) {
-        return min(min(segDist(p, uQuad[0], uQuad[1]), segDist(p, uQuad[1], uQuad[2])),
-                   min(segDist(p, uQuad[2], uQuad[3]), segDist(p, uQuad[3], uQuad[0])));
+      float edgeDist(vec2 p, vec2 q[4]) {
+        return min(min(segDist(p, q[0], q[1]), segDist(p, q[1], q[2])),
+                   min(segDist(p, q[2], q[3]), segDist(p, q[3], q[0])));
       }
 
       vec3 halftone(vec2 p, float cell, float div, vec3 paper, vec3 ink) {
@@ -644,8 +690,8 @@
           vec3 s = clamp(vec3(dot(c, vec3(0.393, 0.769, 0.189)),
                               dot(c, vec3(0.349, 0.686, 0.168)),
                               dot(c, vec3(0.272, 0.534, 0.131))), 0.0, 1.0);
-          vec2 ctr = (uBox.xy + uBox.zw) * 0.5;
-          float maxD = max(length(uBox.zw - ctr), 1.0);
+          vec2 ctr = (gBox.xy + gBox.zw) * 0.5;
+          float maxD = max(length(gBox.zw - ctr), 1.0);
           s *= clamp(1.0 - t * length(p - ctr) / maxD, 0.0, 1.0);
           float frame = floor(uTime * 24.0);
           s += hash(floor(p) + vec2(frame * 17.0, frame * 31.0)) * (50.0 * t / 255.0);
@@ -683,7 +729,7 @@
           return c * 0.06 + hue * edge * 1.3;
         }
         if (id == 10) {                                 // Kaleidoscope: number of mirrors
-          vec2 ctr = (uBox.xy + uBox.zw) * 0.5;
+          vec2 ctr = (gBox.xy + gBox.zw) * 0.5;
           vec2 d = p - ctr;
           float n = 2.0 * floor(3.0 * pow(1.7, k) + 0.5);
           float seg = 6.28318 / n;
@@ -731,45 +777,59 @@
 
       void main() {
         vec2 p = vec2(gl_FragCoord.x, uRes.y - gl_FragCoord.y);
-        vec3 live = cam(p);
-        vec3 c = live;
-        if (uAlpha > 0.001) {
-          float d  = edgeDist(p);
-          float sd = inQuad(p) ? d : -d;
-          float aa = uDpr;
-          float cover = smoothstep(-aa, aa, sd) * uAlpha;
-          if (cover > 0.0) {
-            gFrozen = uUseFrozen == 1;
-            vec3 src = cam(p);
-            vec3 f = applyFilter(uFilter, p, src, uTune);
+        if (uBase == 1) { outColor = vec4(cam(p), 1.0); return; }
 
-            if (uTrans < 1.0) {
-              vec3 old = applyFilter(uPrevFilter, p, src, uTune);
-              vec2 ctr = (uBox.xy + uBox.zw) * 0.5;
-              vec2 hsz = max((uBox.zw - uBox.xy) * 0.5, vec2(1.0));
-              float u;
-              if (dot(uTransDir, uTransDir) > 0.0) {
-                float ext = abs(uTransDir.x) * hsz.x + abs(uTransDir.y) * hsz.y;
-                u = (dot(p - ctr, uTransDir) / ext + 1.0) * 0.5;
-              } else {
-                u = length((p - ctr) / hsz) / 1.4142;
-              }
-              float front = uTrans * 1.3 - 0.15;
-              float m = 1.0 - smoothstep(front - 0.04, front + 0.04, u);
-              f = mix(old, f, m);
-              f += exp(-abs(u - front) * 40.0) * 0.6 * (1.0 - uTrans);
-            }
-            c = mix(live, min(f, vec3(1.0)), cover);
-            gFrozen = false;
-          }
-          float line = 0.75 * uDpr;
-          c = mix(c, uOutline, (1.0 - smoothstep(line, line + aa, d)) * uAlpha);
+        gFrozen = uUseFrozen == 1;
+        float aa = uDpr;
+        float line = 0.75 * uDpr;
+
+        // Pick the band under this pixel (the one covering it most, where two
+        // share an edge) so the filter only runs once, and build the outline.
+        int band = -1;
+        float cover = 0.0, outline = 0.0;
+        for (int k = 0; k < 4; k++) {
+          float a = uBand[k] * uAlpha;
+          if (a < 0.001) continue;
+          vec2 q[4] = vec2[4](uPts[k], uPts[k + 5], uPts[k + 6], uPts[k + 1]);
+          float d  = edgeDist(p, q);
+          float cv = smoothstep(-aa, aa, inQuad(p, q) ? d : -d) * a;
+          if (cv > cover) { cover = cv; band = k; }
+          outline = max(outline, (1.0 - smoothstep(line, line + aa, d)) * a);
         }
-        outColor = vec4(c, 1.0);
+
+        vec3 f = vec3(0.0);
+        if (band >= 0) {
+          gBox = uBox[band];
+          vec3 src = cam(p);
+          f = applyFilter((uFilter + band) % NUM_FILTERS, p, src, uTune);
+
+          if (uTrans < 1.0) {
+            vec3 old = applyFilter((uPrevFilter + band) % NUM_FILTERS, p, src, uTune);
+            vec2 ctr = (gBox.xy + gBox.zw) * 0.5;
+            vec2 hsz = max((gBox.zw - gBox.xy) * 0.5, vec2(1.0));
+            float u;
+            if (dot(uTransDir, uTransDir) > 0.0) {
+              float ext = abs(uTransDir.x) * hsz.x + abs(uTransDir.y) * hsz.y;
+              u = (dot(p - ctr, uTransDir) / ext + 1.0) * 0.5;
+            } else {
+              u = length((p - ctr) / hsz) / 1.4142;
+            }
+            float front = uTrans * 1.3 - 0.15;
+            float m = 1.0 - smoothstep(front - 0.04, front + 0.04, u);
+            f = mix(old, f, m);
+            f += exp(-abs(u - front) * 40.0) * 0.6 * (1.0 - uTrans);
+          }
+          f = min(f, vec3(1.0));
+        }
+        // Premultiplied layer: the filtered bands with the outline over them.
+        float body = cover * (1.0 - outline);
+        outColor = vec4(f * body + uOutline * outline, body + outline);
       }`;
 
     let gl, U = {};
-    let videoTex, snapTex, frozenTex, videoFbo;
+    let videoTex, snapTex, videoFbo;
+    const spare = [];   // snapshot textures from cleared stamps, reused for new ones
+    const takeTexture = () => spare.pop() || makeTexture();
 
     function makeTexture() {
       const t = gl.createTexture();
@@ -800,7 +860,7 @@
       if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
       gl.useProgram(prog);
 
-      for (const name of ["uVideo", "uFrozen", "uUseFrozen", "uRes", "uCover", "uQuad", "uBox", "uAlpha",
+      for (const name of ["uVideo", "uFrozen", "uUseFrozen", "uBase", "uRes", "uCover", "uPts", "uBox", "uBand", "uAlpha",
                           "uFilter", "uPrevFilter", "uTrans", "uTransDir", "uTune", "uUnit", "uDpr", "uTime", "uOutline"]) {
         U[name] = gl.getUniformLocation(prog, name);
       }
@@ -809,7 +869,6 @@
 
       videoTex = makeTexture();
       snapTex = makeTexture();
-      frozenTex = makeTexture();
       videoFbo = gl.createFramebuffer();
     }
 
@@ -822,28 +881,66 @@
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
     }
 
-    function toggleFreeze(now, vw, vh) {
-      if (frozen) {
-        frozen = false;
-        closed = true;
-        $("frozen").hidden = true;
-        return;
-      }
-      // Freeze the portal as it was just before the fist closed, so one side
-      // hasn't already collapsed into the fist.
-      if (goodQuad && now - goodAt < 1000) {
-        [frozenTex, snapTex] = [snapTex, frozenTex];
-        frozenQuad = cloneQuad(goodQuad);
-        frozenTune = goodTune;
+    // Pin a copy of the portal as it was just before the fist closed, so one side
+    // hasn't already collapsed into the fist. The live portal carries on.
+    function addStamp(now, vw, vh) {
+      let s;
+      if (goodPts && now - goodAt < 1000) {
+        s = { tex: snapTex, pts: goodPts, bands: goodBands, tune: goodTune };
+        snapTex = takeTexture();
+        goodPts = null;   // that snapshot belongs to the stamp now
       } else if (display && now - lastAny < 500) {
-        copyVideoTo(frozenTex, vw, vh);
-        frozenQuad = cloneQuad(display);
-        frozenTune = tune;
+        s = { tex: takeTexture(), pts: cloneHands(display), bands: [...bandOn], tune };
+        copyVideoTo(s.tex, vw, vh);
       } else {
         return;
       }
-      frozen = true;
-      $("frozen").hidden = false;
+      stamps.push({ ...s, filter: filterIdx });
+      while (stamps.length > MAX_STAMPS) spare.push(stamps.shift().tex);
+      closed = true;      // hands opening out of the fist shouldn't count as a pinch
+      showStamps();
+    }
+    function dropStamps(all) {
+      (all ? stamps.splice(0) : stamps.splice(-1)).forEach((s) => spare.push(s.tex));
+      showStamps();
+    }
+
+    // One portal pass: its bands blended over what's already drawn, scissored to
+    // the visible bands so the shader only runs where the portal is.
+    function drawPortal(hands, view, o) {
+      const xy = hands.flat().map(([x, y]) => [view.offX + x * view.scale, view.offY + y * view.scale]);
+      const pts = new Float32Array(20), boxes = new Float32Array(16);
+      xy.forEach(([x, y], i) => { pts[i * 2] = x; pts[i * 2 + 1] = y; });
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (let k = 0; k < 4; k++) {
+        const band = [xy[k], xy[k + 1], xy[k + 5], xy[k + 6]];
+        const xs = band.map((pt) => pt[0]), ys = band.map((pt) => pt[1]);
+        const box = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+        boxes.set(box, k * 4);
+        if (o.bands[k] > 0.001) {
+          x0 = Math.min(x0, box[0]); y0 = Math.min(y0, box[1]);
+          x1 = Math.max(x1, box[2]); y1 = Math.max(y1, box[3]);
+        }
+      }
+      const pad = 4 * dpr;   // room for the outline
+      x0 = Math.max(0, Math.floor(x0 - pad)); y0 = Math.max(0, Math.floor(y0 - pad));
+      x1 = Math.min(view.W, Math.ceil(x1 + pad)); y1 = Math.min(view.H, Math.ceil(y1 + pad));
+      if (x1 <= x0 || y1 <= y0) return;
+      gl.scissor(x0, view.H - y1, x1 - x0, y1 - y0);
+
+      gl.uniform2fv(U.uPts, pts);
+      gl.uniform4fv(U.uBox, boxes);
+      gl.uniform1fv(U.uBand, o.bands);
+      gl.uniform1f(U.uAlpha, o.alpha);
+      gl.uniform1i(U.uUseFrozen, o.stamp ? 1 : 0);
+      gl.uniform1i(U.uFilter, o.filter);
+      gl.uniform1i(U.uPrevFilter, o.prev);
+      gl.uniform1f(U.uTrans, o.trans);
+      gl.uniform2f(U.uTransDir, transDir[0], transDir[1]);
+      gl.uniform1f(U.uTune, o.tune);
+      if (o.stamp) gl.uniform3f(U.uOutline, 0.74, 0.84, 1.0);
+      else gl.uniform3f(U.uOutline, 1, 1, 1);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
     }
 
     let dpr = 1;
@@ -881,51 +978,48 @@
       if (now - fpsWindowStart > 1000) { detectFps = Math.max(detectCount, 1); detectCount = 0; fpsWindowStart = now; }
 
       const active = tracked && now - lastAny < LOST_MS && now - lastBoth < BRIDGE_MS;
-      if (!active && !frozen && now - lastAny > 500) targetTune = 0.5;
+      if (!active && now - lastAny > 500) targetTune = 0.5;
 
       // Ease toward the tracked portal. Slower cameras get a slightly longer ease,
       // so a 15 fps webcam still glides instead of stepping.
       if (active && display) {
         const tau = Math.min(0.06, Math.max(0.015, 0.5 / detectFps));
         const k = 1 - Math.exp(-dt / tau);
-        for (let i = 0; i < 4; i++) {
-          display[i][0] += (tracked[i][0] - display[i][0]) * k;
-          display[i][1] += (tracked[i][1] - display[i][1]) * k;
-        }
+        display.forEach((hand, h) => hand.forEach((p, f) => {
+          p[0] += (tracked[h][f][0] - p[0]) * k;
+          p[1] += (tracked[h][f][1] - p[1]) * k;
+        }));
       }
+      const kb = 1 - Math.exp(-dt / BAND_TAU);
+      bandAlpha = bandAlpha.map((a, k) => a + ((bandOn[k] ? 1 : 0) - a) * kb);
       tune += (targetTune - tune) * (1 - Math.exp(-dt / TUNE_TAU));
-      portalAlpha += ((active || frozen ? 1 : 0) - portalAlpha) * (1 - Math.exp(-dt / FADE_TAU));
+      // The live portal steps aside while a fist is held, instead of sitting crumpled over the new stamp.
+      portalAlpha += ((active && !fistLatched ? 1 : 0) - portalAlpha) * (1 - Math.exp(-dt / FADE_TAU));
       trans = Math.min(1, trans + dt / TRANS_S);
 
       if (active && poseGood && display) {
         copyVideoTo(snapTex, vw, vh);
-        goodQuad = cloneQuad(display);
+        goodPts = cloneHands(display);
+        goodBands = [...bandOn];
         goodAt = now;
         goodTune = tune;
       }
-      if (freezeRequest) { freezeRequest = false; toggleFreeze(now, vw, vh); }
+      if (stampRequest) { stampRequest = false; addStamp(now, vw, vh); }
 
-      const geom = frozen ? frozenQuad : display;
-      const drawTune = frozen ? frozenTune : tune;
-      const quad = new Float32Array(8);
-      let box = [0, 0, 0, 0];
-      if (geom) {
-        const pts = [0, 2, 3, 1].map((i) => [offX + geom[i][0] * scale, offY + geom[i][1] * scale]);
-        pts.forEach((pt, i) => { quad[i * 2] = pt[0]; quad[i * 2 + 1] = pt[1]; });
-        const xs = pts.map((pt) => pt[0]), ys = pts.map((pt) => pt[1]);
-        box = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
-      }
+      const bandsKey = bandOn.join();
+      if (bandsKey !== shownBands) { shownBands = bandsKey; showFilter(); }
 
-      $("hint").classList.toggle("gone", !(trackingReady && !active && !frozen && now - Math.max(lastAny, startedAt) > 2000));
-      showTune(drawTune, Math.abs(drawTune - 0.5) > 0.03 && (active || frozen));
+      $("hint").classList.toggle("gone", !(trackingReady && !active && now - Math.max(lastAny, startedAt) > 2000));
+      showTune(tune, Math.abs(tune - 0.5) > 0.03 && active);
 
       if (showDebug) {
         const bridging = active && now - lastBoth > 50;
         $("debug").textContent =
-          `hands      ${handsSeen}${bridging ? "  (bridging one hand)" : ""}   index curl ${indexCurls.map((c) => c.toFixed(2)).join(" ") || "–"}\n` +
+          `hands      ${handsSeen}${bridging ? "  (bridging one hand)" : ""}   bands ${bandOn.map(Number).join(" ")}\n` +
+          `curls      ${handCurls.map((c) => c.map((v) => v.toFixed(2)).join(" ")).join("  |  ") || "–"}  (index..pinky, out > ${FINGER_OUT_AT}, in < ${FINGER_IN_AT})\n` +
           `pinch      close ${close === null ? "–" : close.toFixed(2)}  (switch < ${CLOSE_AT}, re-arm > ${REOPEN_AT})  ${closed ? "closed" : "armed"}\n` +
-          `fist       ${fistNow ? (fistSince !== null ? `holding ${Math.round(now - fistSince)} ms` : "yes") : "no"}   frozen ${frozen ? "yes" : "no"}\n` +
-          `tilt       ${tiltDeg.toFixed(1)}°   tune ${drawTune.toFixed(2)}\n` +
+          `fist       ${fistNow ? (fistSince !== null ? `holding ${Math.round(now - fistSince)} ms` : "yes") : "no"}   stamps ${stamps.length}\n` +
+          `tilt       ${tiltDeg.toFixed(1)}°   tune ${tune.toFixed(2)}\n` +
           `tracking   ${detectFps} fps   camera ${vw}×${vh}   low-light boost ${boost >= 1.1 && canBoost ? "×" + boost.toFixed(1) : "off"}`;
       }
 
@@ -933,28 +1027,32 @@
       gl.viewport(0, 0, W, H);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, videoTex);
-      gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, frozenTex);
-
-      const eased = trans * trans * (3 - 2 * trans);
-      gl.uniform1i(U.uUseFrozen, frozen ? 1 : 0);
       gl.uniform2f(U.uRes, W, H);
       gl.uniform4f(U.uCover, offX, offY, dW, dH);
-      gl.uniform2fv(U.uQuad, quad);
-      gl.uniform4f(U.uBox, ...box);
-      gl.uniform1f(U.uAlpha, geom ? portalAlpha : 0);
-      gl.uniform1i(U.uFilter, filterIdx);
-      gl.uniform1i(U.uPrevFilter, prevFilter);
-      gl.uniform1f(U.uTrans, eased);
-      gl.uniform2f(U.uTransDir, transDir[0], transDir[1]);
-      gl.uniform1f(U.uTune, drawTune);
       gl.uniform1f(U.uUnit, Math.max(dW, dH) / 640);
       gl.uniform1f(U.uDpr, dpr);
       gl.uniform1f(U.uTime, now / 1000);
-      if (frozen) gl.uniform3f(U.uOutline, 0.74, 0.84, 1.0);
-      else gl.uniform3f(U.uOutline, 1, 1, 1);
 
+      // Camera first, then the stamps oldest to newest, then the live portal on top.
+      gl.uniform1i(U.uBase, 1);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      gl.uniform1i(U.uBase, 0);
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.enable(gl.SCISSOR_TEST);
+      const view = { offX, offY, scale, W, H };
+      gl.activeTexture(gl.TEXTURE1);
+      for (const s of stamps) {
+        gl.bindTexture(gl.TEXTURE_2D, s.tex);
+        drawPortal(s.pts, view, { bands: s.bands.map(Number), alpha: 1, filter: s.filter, prev: s.filter, trans: 1, tune: s.tune, stamp: true });
+      }
+      if (display && portalAlpha > 0.001) {
+        const eased = trans * trans * (3 - 2 * trans);
+        drawPortal(display, view, { bands: bandAlpha, alpha: portalAlpha, filter: filterIdx, prev: prevFilter, trans: eased, tune, stamp: false });
+      }
+      gl.disable(gl.SCISSOR_TEST);
+      gl.disable(gl.BLEND);
     }
 
     // ================= Camera =================

@@ -182,14 +182,17 @@
     const FIST_RELEASE_MS = 150;
     const EXTENDED       = 1.30;  // a finger above this on each hand = clean portal pose (used for freezing)
 
-    // Bands: thumb and index always make the portal; middle, ring and pinky join it when
-    // they're out on both hands, each adding a band (see portalHands for how they stack).
+    // Bands: thumb and index always make the portal; middle, ring and pinky each add a band
+    // once they're out on both hands, and take it away once they're tucked on both (see
+    // portalHands for how the bands stack).
     const FINGER_OUT_AT = 1.30;   // same ratio as the fist check: above this a finger counts as out
     const FINGER_IN_AT  = 1.15;   // ...and below this it counts as tucked away again
     const BAND_ON_MS    = 60;     // a finger must be out this long before its band opens...
     const BAND_OFF_MS   = 300;    // ...and tucked this long before it closes, so twists and shakes don't flicker it
     const BAND_TAU      = 0.08;
     const STACK_BLEND   = 0.3;    // palm lengths: fingertips closer than this across the portal start sharing a spot
+    const AXIS_SLACK    = 6 * Math.PI / 180;   // the portal's direction ignores turns smaller than this...
+    const AXIS_TAU      = 0.15;   // ...and eases round past it over about this long (s)
 
     // Swipe
     const SWIPE_WINDOW_MS   = 300;
@@ -204,10 +207,12 @@
     // Tracking / smoothing
     const BRIDGE_MS  = 500;   // keep the portal alive this long while one hand is missing (it coasts meanwhile)
     const LOST_MS    = 150;
-    const MIN_CUTOFF = 1.2;
+    const MIN_CUTOFF = 0.8;
     const BETA       = 0.04;
+    const D_CUTOFF   = 3.0;   // Hz: how quickly the smoothing notices a change of speed
+    const CORNER_CUTOFF = 2.0;   // Hz: the band corners' own smoothing when nearly still (see cornerEuro)
     const REF_PALM   = 120;   // px. BETA is tuned for a hand this size; speeds are rescaled so near and far hands smooth alike
-    const TIP_JUMP   = 0.7;   // palm lengths a fingertip may leap (relative to its wrist) in one frame before it's doubted...
+    const TIP_JUMP   = 0.9;   // palm lengths a fingertip may leap (relative to its wrist) per 1/30 s before it's doubted...
     const TIP_DOUBT  = 2;     // ...for this many frames, after which the leap is believed
     const COAST_TAU  = 0.25;  // s: a hand that drops out keeps drifting, slowing with this time constant
     const FADE_TAU   = 0.06;
@@ -284,6 +289,7 @@
     let fingerSince = [null, null, null, null, null];   // when each finger started disagreeing with fingerOn
     let presence = [1, 1, 0, 0, 0];   // eased fingerOn: a finger opening or closing its band
     let livePts = null, liveBands = [true, false, false, false], shownBands = "";   // the live portal as drawn (see portalHands)
+    let portalAngle = null;       // direction from the left hand's fingertips to the right's, with slack
 
     // Swipe
     let swipeHistory = [], lastSwipe = -Infinity;
@@ -419,26 +425,28 @@
     const cloneHands = (hs) => hs.map((h) => h.map((p) => [...p]));
 
     // ================= Hand model =================
-    // Each hand's five fingertips, smoothed on screen. On top of plain smoothing:
-    //  - a fingertip that leaps relative to its wrist in one frame (usually the tracker
-    //    losing a hidden finger) is held back a couple of frames, riding along with the
-    //    wrist meanwhile, before the leap is believed;
-    //  - a hand that drops out keeps moving with the other hand (hands framing a portal
-    //    mostly move together, shakes included), or drifts on and slows if both are gone.
+    // Each hand's five fingertips, smoothed on screen, plus its palm: the middle of the
+    // wrist and knuckles, which stays put while the fingers move. On top of plain smoothing:
+    //  - a fingertip that leaps relative to its wrist faster than a hand can move (usually
+    //    the tracker losing a hidden finger) is held back a couple of frames, riding along
+    //    with the wrist meanwhile, before the leap is believed;
+    //  - a hand that drops out keeps moving with the other hand's palm (hands framing a
+    //    portal mostly move together, shakes included), or drifts on and slows if both are
+    //    gone. Following the palm, not the fingertips, means pinching or curling one hand
+    //    doesn't drag the other around.
     // Everything stays in 2D: MediaPipe's depth estimate is too noisy to build on.
     class HandModel {
       constructor() {
-        this.euro = Array.from({ length: 10 }, () => new OneEuro(MIN_CUTOFF, BETA));   // 5 tips × x/y
+        this.euro = Array.from({ length: 12 }, () => new OneEuro(MIN_CUTOFF, BETA, D_CUTOFF));   // 5 tips + palm, × x/y
         this.reset();
       }
       reset() {
         this.tips = null;              // smoothed fingertips, px
-        this.wrist = null;             // raw wrist, px
+        this.palm = null;              // smoothed palm centre, px...
+        this.vel = [0, 0];             // ...and its velocity, px/s
+        this.lastPalm = null; this.lastVel = [0, 0];
         this.offsets = null;           // raw fingertip offsets from the wrist, as last believed
         this.doubt = [0, 0, 0, 0, 0];  // frames each fingertip's leap has been held back
-        this.center = null;            // middle of the smoothed fingertips...
-        this.vel = [0, 0];             // ...and its velocity, px/s
-        this.lastCenter = null; this.lastVel = [0, 0];
         this.drift = null;             // while coasting: where it started and how it's moving
         this.seenAt = -Infinity;       // ms
         this.t = 0;                    // s, last update
@@ -448,10 +456,11 @@
 
       observe(h, now) {
         const t = now / 1000, s = REF_PALM / h.palm;
+        const frames = Math.max(1, (t - this.t) * 30);   // a slow camera allows a bigger leap per frame
         if (!this.offsets) this.offsets = h.tips.map((p) => [p[0] - h.w[0], p[1] - h.w[1]]);
         const raw = h.tips.map((p, f) => {
           const off = [p[0] - h.w[0], p[1] - h.w[1]], was = this.offsets[f];
-          if (dist(off, was) > TIP_JUMP * h.palm && this.doubt[f] < TIP_DOUBT) {
+          if (dist(off, was) > TIP_JUMP * h.palm * frames && this.doubt[f] < TIP_DOUBT) {
             this.doubt[f]++;
             return [h.w[0] + was[0], h.w[1] + was[1]];
           }
@@ -459,22 +468,23 @@
           this.offsets[f] = off;
           return p;
         });
-        this.tips = raw.map((p, f) => [this.euro[f * 2].filter(p[0], t, s), this.euro[f * 2 + 1].filter(p[1], t, s)]);
-        this.wrist = [...h.w];
+        const smooth = (p, i) => [this.euro[i * 2].filter(p[0], t, s), this.euro[i * 2 + 1].filter(p[1], t, s)];
+        this.tips = raw.map(smooth);
 
-        const c = mean2(this.tips);
-        this.lastCenter = this.center; this.lastVel = [...this.vel];   // as of last frame, for the other hand to line up with
-        if (this.center && t > this.t) {
+        const palm = smooth(h.center, 5);
+        this.lastPalm = this.palm; this.lastVel = [...this.vel];   // as of last frame, for the other hand to line up with
+        if (this.palm && t > this.t) {
           const k = 1 - Math.exp(-(t - this.t) / 0.05);
-          this.vel = this.vel.map((v, d) => v + ((c[d] - this.center[d]) / (t - this.t) - v) * k);
+          this.vel = this.vel.map((v, d) => v + ((palm[d] - this.palm[d]) / (t - this.t) - v) * k);
         }
-        this.center = c;
+        this.palm = palm;
         this.seenAt = now; this.t = t; this.drift = null;
       }
 
+
       // Not seen this frame: keep the hand's shape and let it drift on. While the other
-      // hand is in view this one moves with it, and only the difference between the two
-      // hands' speeds fades out. With neither in view it just drifts on, slowing down.
+      // hand is in view this one moves with its palm, and only the difference between the
+      // two hands' speeds fades out. With neither in view it just drifts on, slowing down.
       coast(now, partner) {
         const t = now / 1000, dt = t - this.t;
         if (!this.tips || dt <= 0) return;
@@ -485,8 +495,8 @@
           this.drift = {
             withPartner,
             tips: this.tips.map((p) => [...p]),
-            wrist: [...this.wrist],
-            from: withPartner ? [...(partner.lastCenter || partner.center)] : null,
+            palm: [...this.palm],
+            from: withPartner ? [...(partner.lastPalm || partner.palm)] : null,
             rel: this.vel.map((v, d) => v - (withPartner ? partner.lastVel[d] : 0)),
             own: [0, 0],
           };
@@ -494,31 +504,33 @@
         const c = this.drift;
         c.own = c.own.map((m, d) => m + c.rel[d] * dt);
         c.rel = c.rel.map((v) => v * Math.exp(-dt / COAST_TAU));
-        const shared = withPartner ? [0, 1].map((d) => partner.center[d] - c.from[d]) : [0, 0];
-        this.tips = c.tips.map((p, f) => p.map((v, d) => {
+        const shared = withPartner ? [0, 1].map((d) => partner.palm[d] - c.from[d]) : [0, 0];
+        const move = (p, i) => p.map((v, d) => {
           const moved = v + shared[d] + c.own[d];
-          this.euro[f * 2 + d].shift(moved);
+          this.euro[i * 2 + d].shift(moved);
           return moved;
-        }));
-        this.wrist = c.wrist.map((v, d) => v + shared[d] + c.own[d]);
-        this.center = mean2(this.tips);
+        });
+        this.tips = c.tips.map(move);
+        this.palm = move(c.palm, 5);
       }
     }
     const model = [new HandModel(), new HandModel()];   // [left, right] on screen
 
     // Bands stack across the portal. Each hand's fingertips are sorted by where they sit
-    // across the line from one hand's fingertips to the other's, and paired in that
-    // order: top with top, next with next. Neighbouring bands then can't cross into
-    // bow-ties, whichever way either hand is turned, rolled or curled. When the fingertips
-    // come within a palm of each other (or interlock) that line gets shaky, so it leans
-    // on the line between the wrists instead, which stay apart.
+    // across the line from one hand's fingertips to the other's, and paired in that order:
+    // top with top, next with next. Neighbouring bands then can't cross into bow-ties,
+    // whichever way either hand is turned, rolled or curled. That line only turns once it
+    // has drifted more than a few degrees (AXIS_SLACK), and then eases round (AXIS_TAU), so
+    // fingertip jitter, or pinching and curling one hand, doesn't swing it and shuffle the
+    // other hand's bands.
     // Two fingertips at nearly the same height across the portal (fingers fanned out
     // flat, or passing each other mid-twist) also share their position along it, so when
     // they swap places their corners slide through the same spot instead of jumping from
     // one finger to the other. A finger joining the portal grows out of the finger before
     // it (and shrinks back into it when tucked), so bands open and close instead of
-    // popping. Returns the corners as drawn and which bands are open.
-    function portalHands([L, R], [wl, wr], presence) {
+    // popping. Returns the corners and which bands are open; the render loop smooths the
+    // corners once more (see cornerEuro).
+    function portalHands([L, R], presence, dt) {
       const shown = [0, 1, 2, 3, 4].filter((f) => presence[f] > 0.001);
       const place = (h) => shown.map((f) => {
         if (presence[f] >= 1) return h[f];
@@ -528,11 +540,11 @@
       });
       const [Lp, Rp] = [place(L), place(R)];
       const [cl, cr] = [mean2(Lp), mean2(Rp)];
-      const gap = Math.hypot(cr[0] - cl[0], cr[1] - cl[1]);
-      const wristLen = Math.hypot(wr[0] - wl[0], wr[1] - wl[1]) || 1, lean = Math.max(0, lastPalm - gap);
-      const dir = [0, 1].map((d) => cr[d] - cl[d] + (wr[d] - wl[d]) / wristLen * lean);
-      const len = Math.hypot(dir[0], dir[1]) || 1;
-      const u = [dir[0] / len, dir[1] / len], v = [-u[1], u[0]];   // along, across
+      const want = Math.atan2(cr[1] - cl[1], cr[0] - cl[0]);
+      if (portalAngle === null) portalAngle = want;
+      const off = Math.atan2(Math.sin(want - portalAngle), Math.cos(want - portalAngle));
+      if (Math.abs(off) > AXIS_SLACK) portalAngle += (off - Math.sign(off) * AXIS_SLACK) * (1 - Math.exp(-dt / AXIS_TAU));
+      const u = [Math.cos(portalAngle), Math.sin(portalAngle)], v = [-u[1], u[0]];   // along, across
       const blend = STACK_BLEND * lastPalm;
       const stack = (ps, c) => {
         const s = ps.map((p) => ({ along: (p[0] - c[0]) * u[0] + (p[1] - c[1]) * u[1], across: (p[0] - c[0]) * v[0] + (p[1] - c[1]) * v[1] }));
@@ -548,6 +560,12 @@
       };
       return { pts: [stack(Lp, cl), stack(Rp, cr)], bands: [0, 1, 2, 3].map((k) => k < shown.length - 1) };
     }
+
+    // The drawn corners get the fingertips' kind of smoothing too: firm when nearly still,
+    // light when moving fast. Where fingertips sit almost level, a tiny wobble in which
+    // one is higher shifts the shared corner further than the fingertips themselves move;
+    // this keeps that from showing as jiggle without slowing the portal down.
+    const cornerEuro = Array.from({ length: 20 }, () => new OneEuro(CORNER_CUTOFF, BETA, D_CUTOFF));   // 2 hands × 5 corners × x/y
 
     // Which detected hand is the left one and which the right. Normally that's screen
     // order, but if the other pairing carries on from the last frame much better (hands
@@ -585,8 +603,9 @@
         const at = wl ? (j) => [wl[j].x, wl[j].y, wl[j].z] : (j) => [...toPx(lm[j]), 0];
         const curls = FINGERS.map(([tip, mcp]) => dist3(at(tip), at(WRIST)) / Math.max(dist3(at(mcp), at(WRIST)), 1e-6));
         const tips = TIPS.map((j) => toPx(lm[j]));
+        const center = mean2([WRIST, 5, MIDDLE_MCP, 13, 17].map((j) => toPx(lm[j])));   // wrist and knuckles
         return {
-          w, palm, curls, tips,
+          w, palm, center, curls, tips,
           fist: curls[0] < FIST_INDEX && curls.slice(1).every((c) => c < FIST_OTHERS),
         };
       });
@@ -617,17 +636,22 @@
         fingerOut = allTucked();
         fingerOn = noFingers();
         fingerSince = [null, null, null, null, null];
+        portalAngle = null;
+        cornerEuro.forEach((f) => f.reset());
         display = cloneHands(tracked);
       }
 
-      // ---- Bands: a finger joins the portal once it's out on both hands, and has to stay
-      // that way for a moment, so a twist or a shake doesn't flick its band open and shut.
+      // ---- Bands: a finger joins the portal once it's out on both hands and leaves once
+      // it's tucked on both, so pinching or curling one hand doesn't fold up the other
+      // hand's bands. Either way it has to stay that way for a moment, so a twist or a
+      // shake doesn't flick its band open and shut.
       [L, R].forEach((h, s) => h.curls.forEach((c, f) => {
         if (c > FINGER_OUT_AT) fingerOut[s][f] = true;
         else if (c < FINGER_IN_AT) fingerOut[s][f] = false;
       }));
       for (let f = 2; f < 5; f++) {
-        const want = fingerOut.every((out) => out[f - 1]);   // fingerOut runs index..pinky
+        const outOn = fingerOut.filter((out) => out[f - 1]).length;   // fingerOut runs index..pinky
+        const want = fingerOn[f] ? outOn > 0 : outOn === 2;
         if (want === fingerOn[f]) fingerSince[f] = null;
         else if (fingerSince[f] === null) fingerSince[f] = now;
         else if (now - fingerSince[f] >= (want ? BAND_ON_MS : BAND_OFF_MS)) { fingerOn[f] = want; fingerSince[f] = null; }
@@ -1234,22 +1258,19 @@
       const active = tracked && now - lastAny < LOST_MS && now - lastBoth < BRIDGE_MS;
       if (!active && now - lastAny > 500) targetTune = 0.5;
 
-      // Ease toward the tracked portal. Slower cameras get a slightly longer ease,
-      // so a 15 fps webcam still glides instead of stepping.
-      if (active && display) {
-        const tau = Math.min(0.06, Math.max(0.015, 0.5 / detectFps));
-        const k = 1 - Math.exp(-dt / tau);
-        display.forEach((hand, h) => hand.forEach((p, f) => {
-          p[0] += (tracked[h][f][0] - p[0]) * k;
-          p[1] += (tracked[h][f][1] - p[1]) * k;
-        }));
-      }
+      // The portal moves with each new camera frame, the same moment the video does. Easing
+      // between frames would look smoother on its own but leaves it trailing the hands.
+      if (active && display) display = cloneHands(tracked);
       const kb = 1 - Math.exp(-dt / BAND_TAU);
       presence = presence.map((p, f) => {
         const goal = fingerOn[f] ? 1 : 0, eased = p + (goal - p) * kb;
         return Math.abs(goal - eased) < 0.002 ? goal : eased;
       });
-      if (display) ({ pts: livePts, bands: liveBands } = portalHands(display, model.map((m) => m.wrist), presence));
+      if (display) {
+        const { pts, bands } = portalHands(display, presence, dt), t = now / 1000, s = REF_PALM / lastPalm;
+        livePts = pts.map((hand, h) => hand.map((p, i) => [0, 1].map((d) => cornerEuro[(h * 5 + i) * 2 + d].filter(p[d], t, s))));
+        liveBands = bands;
+      }
       tune += (targetTune - tune) * (1 - Math.exp(-dt / TUNE_TAU));
       // The live portal is hidden while stamped, and stays hidden until the fist that
       // released the stamp opens again, so it doesn't reappear crumpled.

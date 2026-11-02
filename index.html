@@ -185,13 +185,13 @@
     // Bands: thumb and index always make the portal; middle, ring and pinky each add a band
     // once they're out on both hands, and take it away once they're tucked on both (see
     // portalHands for how the bands stack).
-    const FINGER_OUT_AT = 0.70;   // how far a finger points the same way as its palm (1 straight on, -1 folded back): above this it's out
-    const FINGER_IN_AT  = 0.45;   // ...and below this it's tucked away again
+    const FINGER_OUT_AT = 0.80;   // how far a finger points the same way as its palm (1 straight on, -1 folded back): above this it's out
+    const FINGER_IN_AT  = 0.60;   // ...and below this it's tucked away again
     const BAND_ON_MS    = 120;    // a finger must be out this long before its band opens...
     const BAND_OFF_MS   = 200;    // ...and tucked this long before it closes, so twists and shakes don't flicker it
     const BAND_TAU      = 0.08;
-    const SWAP_MARGIN   = 0.12;   // palm lengths: fingertips only trade places in the stack once they've clearly passed each other
-    const SWAP_TAU      = 0.07;   // s: when they do, the two corners glide across over about this long
+    const FLIP_MARGIN   = 0.2;    // palm lengths: a hand only counts as turned over once its fingers have clearly passed this far
+    const FLIP_TAU      = 0.07;   // s: when it does, its corners glide across over about this long
     const BAND_FACING   = 0.6;    // the palm must face the camera at least this squarely (0 edge-on, 1 flat) to judge its fingers
     const AXIS_SLACK    = 6 * Math.PI / 180;   // the portal's direction ignores turns smaller than this...
     const AXIS_TAU      = 0.15;   // ...and eases round past it over about this long (s)
@@ -215,7 +215,7 @@
     const REF_PALM   = 120;   // px. BETA is tuned for a hand this size; speeds are rescaled so near and far hands smooth alike
     const TIP_JUMP   = 0.4;   // palm lengths a fingertip may stray from where its palm says it should be, per 1/30 s
     const TIP_STEADY = 0.25;  // a rejected fingertip has to hold still (relative to the palm) to within this, per 1/30 s...
-    const TIP_DOUBT  = 3;     // ...for this many frames in a row before it's believed
+    const TIP_DOUBT  = 0.13;  // ...for this long (s) before it's believed
     const LABEL_DOUBT = 0.5;  // the tracker calling a hand the other hand, at all, makes the pose suspect (scores start at 0.5)
     const DOUBT_MAX_MS = 1500;// ...but believe it anyway after this long, in case the hand's label was the wrong one
     const SETTLE_TAU = 0.07;  // s: when a corrected point rejoins the truth it glides over about this long
@@ -293,10 +293,11 @@
     let fingerOn = noFingers();   // [thumb..pinky]: in the portal (thumb and index always)
     let fingerSince = [null, null, null, null, null];   // when each finger started disagreeing with fingerOn
     let presence = [1, 1, 0, 0, 0];   // eased fingerOn: a finger opening or closing its band
-    let livePts = null, liveBands = [true, false, false, false], shownBands = "";   // the live portal as drawn (see portalHands)
+    let livePts = null, liveBands = [true, false, false, false], liveOpacity = [1, 0, 0, 0], shownBands = "";   // the live portal as drawn (see portalHands)
     let portalAngle = null;       // the line between the two hands' fingertips, with slack
-    let stackOrder = [[], []];    // each hand's fingers in stack order, [left, right]
-    let swapGlide = [0, 1].map(() => Array.from({ length: 5 }, () => [0, 0]));   // what's left of each corner's slide after a swap
+    let flipped = false;          // one hand is turned over compared with the other, so its corners pair up in reverse
+    let lastPairing = [];         // which of the right hand's fingers each corner slot had last frame
+    let flipGlide = Array.from({ length: 5 }, () => [0, 0]);   // what's left of the right hand's corners' slide after a flip
 
     // Swipe
     let swipeHistory = [], lastSwipe = -Infinity;
@@ -475,8 +476,8 @@
     //    got the pose mirrored, which is by far the best warning of a bad frame there is;
     //  - a fingertip that strays from where its palm says it should be is doubted too;
     //  - a doubted fingertip rides along with the palm instead. It's only believed again
-    //    once it agrees with the palm, or holds steady for a few frames in a row, which a
-    //    point flickering between two guesses never does. Then it glides back, no jump.
+    //    once it agrees with the palm, or holds steady for a moment, which a point
+    //    flickering between two guesses never does. Then it glides back, no jump.
     //  - a hand that drops out keeps moving with the other hand's palm (hands framing a
     //    portal mostly move together, shakes included), or drifts on and slows if both are
     //    gone. Following the palm, not the fingertips, means pinching or curling one hand
@@ -538,9 +539,9 @@
           // Doubted. Has it at least been holding steady relative to the palm?
           const m = this.maybe[f];
           const steady = m && dist(p, carry(m.pts, h.pts, m.p)) / h.palm <= TIP_STEADY * frames;
-          const held = steady ? m.held + 1 : 1;
+          const held = steady ? m.held + dt : 0;
           this.maybe[f] = { p, pts: h.pts, held };
-          if (!this.suspect && held > TIP_DOUBT) {
+          if (!this.suspect && held >= TIP_DOUBT) {
             this.good[f] = { p, pts: h.pts };
             this.maybe[f] = null;
             this.settle[f] = [0, 1].map((d) => this.settle[f][d] + expect[d] - p[d]);
@@ -599,62 +600,51 @@
     }
     const model = [new HandModel(), new HandModel()];   // [left, right] on screen
 
-    // Bands stack across the portal: each hand's fingertips are ordered by where they sit
-    // across the line between the hands, and paired in that order, top with top, next with
-    // next, so neighbouring bands can't cross into bow-ties however either hand is turned.
-    // Corners sit exactly on the fingertips. The order is remembered, and two fingertips
-    // only trade places once one has clearly passed the other (SWAP_MARGIN), so fingers
-    // that sit level can't flicker back and forth; when they do trade, the corners glide
-    // across instead of jumping. A finger joining the portal grows out of the finger before
-    // it (and shrinks back into it when tucked), so bands open and close instead of popping.
-    // The line itself has no direction, so hands crossing over don't turn it end for end,
-    // and it's barely defined when the hands are close, so it stops turning as they meet.
+    // Every corner belongs to one finger for good: thumb, index, middle, ring, pinky, in the
+    // order they sit on the hand. Nothing ever sorts them, so a corner can't wander onto a
+    // neighbouring finger, and two can't share one. Band k joins fingers k and k+1 of each
+    // hand, and a new band fades in between fingers that are already where they belong.
+    // The one thing to handle is a hand turned over relative to the other: pairing thumb to
+    // thumb would then cross the band into a bow-tie, so the right hand's fingers pair up in
+    // reverse. That only changes once both hands clearly say so (FLIP_MARGIN), and the
+    // corners glide across rather than jumping.
+    // The line between the hands has no direction, so hands crossing over don't turn it end
+    // for end, and it's barely defined when the hands are close, so it stops turning as they meet.
     function portalHands([L, R], presence, dt) {
-      const shown = [0, 1, 2, 3, 4].filter((f) => presence[f] > 0.001);
-      const place = (h, f) => {
-        if (presence[f] >= 1) return h[f];
-        let a = f - 1;
-        while (presence[a] < 1) a--;   // the nearest steady finger before it (index at worst)
-        return [0, 1].map((d) => h[a][d] + (h[f][d] - h[a][d]) * presence[f]);
-      };
-      const spots = [L, R].map((h) => { const at = []; shown.forEach((f) => { at[f] = place(h, f); }); return at; });
-      const [cl, cr] = spots.map((at) => mean2(shown.map((f) => at[f])));
+      let n = 2;
+      while (n < 5 && presence[n] > 0.001) n++;   // bands only ever build outwards from the index finger
+      const cl = mean2([L[THUMB], L[INDEX]]), cr = mean2([R[THUMB], R[INDEX]]);
       const want = Math.atan2(cr[1] - cl[1], cr[0] - cl[0]);
-      if (portalAngle === null) { portalAngle = want; stackOrder = [[], []]; }
+      const fresh = portalAngle === null;
+      if (fresh) portalAngle = want;
       const wrap = Math.atan2(Math.sin(want - portalAngle), Math.cos(want - portalAngle));
       const off = wrap > Math.PI / 2 ? wrap - Math.PI : wrap < -Math.PI / 2 ? wrap + Math.PI : wrap;
       const clear = Math.min(1, Math.max(0, (dist(cl, cr) / lastPalm - 0.6) / 0.8));   // 0 touching .. 1 well apart
       if (Math.abs(off) > AXIS_SLACK) portalAngle += (off - Math.sign(off) * AXIS_SLACK) * (1 - Math.exp(-dt / AXIS_TAU)) * clear;
       const v = [-Math.sin(portalAngle), Math.cos(portalAngle)];   // across
-      const fade = Math.exp(-dt / SWAP_TAU), margin = SWAP_MARGIN * lastPalm;
 
-      const pts = spots.map((at, s) => {
-        const across = (f) => at[f][0] * v[0] + at[f][1] * v[1];
-        const was = stackOrder[s];
-        const glide = swapGlide[s];
-        glide.forEach((g) => { g[0] *= fade; g[1] *= fade; });
-        let order;
-        if (!was.length) order = [...shown].sort((a, b) => across(a) - across(b));
-        else {
-          order = was.filter((f) => presence[f] > 0.001);
-          for (const f of shown) if (!order.includes(f)) order.splice(order.indexOf(f - 1) + 1, 0, f);   // joins beside the finger it grows from
-          const same = order.length === was.length;
-          for (let pass = 0; pass < 4; pass++) for (let i = 0; i + 1 < order.length; i++) {
-            if (across(order[i]) - across(order[i + 1]) > margin) {
-              const a = order[i], b = order[i + 1];
-              if (same) for (let d = 0; d < 2; d++) {
-                const gap = at[a][d] - at[b][d];
-                glide[i][d] += gap; glide[i + 1][d] -= gap;
-              }
-              order[i] = b; order[i + 1] = a;
-            }
-          }
-        }
-        stackOrder[s] = order;
-        const corners = order.map((f, i) => [at[f][0] + glide[i][0], at[f][1] + glide[i][1]]);
-        return [0, 1, 2, 3, 4].map((i) => [...corners[Math.min(i, corners.length - 1)]]);   // pad to 5; extra bands stay closed
+      // Which way up is each hand? Compare its last finger with its thumb, across the portal.
+      const updown = (h) => ((h[n - 1][0] - h[0][0]) * v[0] + (h[n - 1][1] - h[0][1]) * v[1]) / lastPalm;
+      const a = updown(L), b = updown(R);
+      if (fresh) flipped = a * b < 0;
+      else if (Math.min(Math.abs(a), Math.abs(b)) > FLIP_MARGIN) flipped = a * b < 0;
+
+      const pairing = [0, 1, 2, 3, 4].slice(0, n).map((i) => (flipped ? n - 1 - i : i));
+      const fade = Math.exp(-dt / FLIP_TAU);
+      flipGlide.forEach((g) => { g[0] *= fade; g[1] *= fade; });
+      if (fresh) flipGlide.forEach((g) => { g[0] = g[1] = 0; });
+      else pairing.forEach((f, i) => {
+        const was = lastPairing[i];
+        if (was !== undefined && was !== f) for (let d = 0; d < 2; d++) flipGlide[i][d] += R[was][d] - R[f][d];
       });
-      return { pts, bands: [0, 1, 2, 3].map((k) => k < shown.length - 1) };
+      lastPairing = pairing;
+
+      const pad = (corners) => [0, 1, 2, 3, 4].map((i) => [...corners[Math.min(i, n - 1)]]);   // extra bands stay closed
+      const left = L.slice(0, n);
+      const right = pairing.map((f, i) => [R[f][0] + flipGlide[i][0], R[f][1] + flipGlide[i][1]]);
+      let open = 1;
+      const opacity = [0, 1, 2, 3].map((k) => (k === 0 ? 1 : (open = Math.min(open, presence[k + 1]))));
+      return { pts: [pad(left), pad(right)], bands: [0, 1, 2, 3].map((k) => k < n - 1), opacity };
     }
 
     // Which detected hand is the left one and which the right. Normally that's screen
@@ -740,10 +730,10 @@
         display = cloneHands(tracked);
       }
 
-      // ---- Bands: a finger joins the portal once it's out on both hands and leaves once
-      // it's tucked on both, so pinching or curling one hand doesn't fold up the other
-      // hand's bands. Either way it has to stay that way for a moment, so a twist or a
-      // shake doesn't flick its band open and shut.
+      // ---- Bands: a finger is in the portal only while it's out on both hands, and each
+      // one needs the finger before it, so a corner never sits on a finger tucked out of
+      // sight. Either way it has to stay that way for a moment, so a twist or a shake
+      // doesn't flick its band open and shut.
       const judged = [L, R].map((h, s) => h.facing >= BAND_FACING && !model[s].suspect);
       [L, R].forEach((h, s) => {
         if (!judged[s]) return;
@@ -753,8 +743,7 @@
         });
       });
       for (let f = 2; f < 5; f++) {
-        const outOn = fingerOut.filter((out) => out[f - 1]).length;   // fingerOut runs index..pinky
-        const want = fingerOn[f] ? outOn > 0 : outOn === 2;
+        const want = fingerOut.every((out) => out[f - 1]) && (f === 2 || fingerOn[f - 1]);   // fingerOut runs index..pinky
         // A band only opens on what both hands show right now, never on a stale reading.
         if (want === fingerOn[f] || (want && !(judged[0] && judged[1]))) fingerSince[f] = null;
         else if (fingerSince[f] === null) fingerSince[f] = now;
@@ -1371,9 +1360,10 @@
         return Math.abs(goal - eased) < 0.002 ? goal : eased;
       });
       if (display) {
-        const { pts, bands } = portalHands(display, presence, dt);
+        const { pts, bands, opacity } = portalHands(display, presence, dt);
         livePts = pts;
         liveBands = bands;
+        liveOpacity = opacity;
       }
       tune += (targetTune - tune) * (1 - Math.exp(-dt / TUNE_TAU));
       // The live portal is hidden while stamped, and stays hidden until the fist that
@@ -1438,7 +1428,7 @@
       gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(gl.TEXTURE_2D, stampTex);
       if (stamp) drawPortal(stamp.pts, view, { bands: stamp.bands.map(Number), alpha: 1, tune: stamp.tune, stamp: true });
-      if (livePts && portalAlpha > 0.001) drawPortal(livePts, view, { bands: liveBands.map(Number), alpha: portalAlpha, tune, stamp: false });
+      if (livePts && portalAlpha > 0.001) drawPortal(livePts, view, { bands: liveOpacity, alpha: portalAlpha, tune, stamp: false });
       gl.disable(gl.SCISSOR_TEST);
       gl.disable(gl.BLEND);
     }

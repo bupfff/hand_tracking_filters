@@ -185,12 +185,14 @@
     // Bands: thumb and index always make the portal; middle, ring and pinky each add a band
     // once they're out on both hands, and take it away once they're tucked on both (see
     // portalHands for how the bands stack).
-    const FINGER_OUT_AT = 1.30;   // same ratio as the fist check: above this a finger counts as out
-    const FINGER_IN_AT  = 1.15;   // ...and below this it counts as tucked away again
-    const BAND_ON_MS    = 60;     // a finger must be out this long before its band opens...
-    const BAND_OFF_MS   = 300;    // ...and tucked this long before it closes, so twists and shakes don't flicker it
+    const FINGER_OUT_AT = 0.70;   // how far a finger points the same way as its palm (1 straight on, -1 folded back): above this it's out
+    const FINGER_IN_AT  = 0.45;   // ...and below this it's tucked away again
+    const BAND_ON_MS    = 120;    // a finger must be out this long before its band opens...
+    const BAND_OFF_MS   = 200;    // ...and tucked this long before it closes, so twists and shakes don't flicker it
     const BAND_TAU      = 0.08;
-    const STACK_BLEND   = 0.3;    // palm lengths: fingertips closer than this across the portal start sharing a spot
+    const SWAP_MARGIN   = 0.12;   // palm lengths: fingertips only trade places in the stack once they've clearly passed each other
+    const SWAP_TAU      = 0.07;   // s: when they do, the two corners glide across over about this long
+    const BAND_FACING   = 0.6;    // the palm must face the camera at least this squarely (0 edge-on, 1 flat) to judge its fingers
     const AXIS_SLACK    = 6 * Math.PI / 180;   // the portal's direction ignores turns smaller than this...
     const AXIS_TAU      = 0.15;   // ...and eases round past it over about this long (s)
 
@@ -210,10 +212,13 @@
     const MIN_CUTOFF = 0.8;
     const BETA       = 0.04;
     const D_CUTOFF   = 3.0;   // Hz: how quickly the smoothing notices a change of speed
-    const CORNER_CUTOFF = 2.0;   // Hz: the band corners' own smoothing when nearly still (see cornerEuro)
     const REF_PALM   = 120;   // px. BETA is tuned for a hand this size; speeds are rescaled so near and far hands smooth alike
-    const TIP_JUMP   = 0.9;   // palm lengths a fingertip may leap (relative to its wrist) per 1/30 s before it's doubted...
-    const TIP_DOUBT  = 2;     // ...for this many frames, after which the leap is believed
+    const TIP_JUMP   = 0.4;   // palm lengths a fingertip may stray from where its palm says it should be, per 1/30 s
+    const TIP_STEADY = 0.25;  // a rejected fingertip has to hold still (relative to the palm) to within this, per 1/30 s...
+    const TIP_DOUBT  = 3;     // ...for this many frames in a row before it's believed
+    const LABEL_DOUBT = 0.5;  // the tracker calling a hand the other hand, at all, makes the pose suspect (scores start at 0.5)
+    const DOUBT_MAX_MS = 1500;// ...but believe it anyway after this long, in case the hand's label was the wrong one
+    const SETTLE_TAU = 0.07;  // s: when a corrected point rejoins the truth it glides over about this long
     const COAST_TAU  = 0.25;  // s: a hand that drops out keeps drifting, slowing with this time constant
     const FADE_TAU   = 0.06;
     const TUNE_TAU   = 0.08;
@@ -289,7 +294,9 @@
     let fingerSince = [null, null, null, null, null];   // when each finger started disagreeing with fingerOn
     let presence = [1, 1, 0, 0, 0];   // eased fingerOn: a finger opening or closing its band
     let livePts = null, liveBands = [true, false, false, false], shownBands = "";   // the live portal as drawn (see portalHands)
-    let portalAngle = null;       // direction from the left hand's fingertips to the right's, with slack
+    let portalAngle = null;       // the line between the two hands' fingertips, with slack
+    let stackOrder = [[], []];    // each hand's fingers in stack order, [left, right]
+    let swapGlide = [0, 1].map(() => Array.from({ length: 5 }, () => [0, 0]));   // what's left of each corner's slide after a swap
 
     // Swipe
     let swipeHistory = [], lastSwipe = -Infinity;
@@ -302,7 +309,7 @@
 
     // Debug
     let showDebug = false, detectCount = 0, detectFps = 30, fpsWindowStart = 0;
-    let handsSeen = 0, handCurls = [];
+    let handsSeen = 0, handCurls = [], handReach = [], handFacing = [];
 
     function switchFilter(step = 1, dir = [0, 0]) {
       prevFilter = filterIdx;
@@ -343,7 +350,8 @@
     }
     function recordFrame(result, now) {
       const pack = (hands) => (hands || []).map((lm) => lm.map((p) => [+p.x.toFixed(5), +p.y.toFixed(5), +p.z.toFixed(5)]));
-      recording.frames.push({ t: Math.round(now - recording.started), hands: pack(result.landmarks), world: pack(result.worldLandmarks) });
+      const handed = (result.handedness || result.handednesses || []).map((c) => [c[0].categoryName, +c[0].score.toFixed(3)]);
+      recording.frames.push({ t: Math.round(now - recording.started), hands: pack(result.landmarks), world: pack(result.worldLandmarks), handed });
       if (recording.frames.length >= RECORD_MAX_FRAMES) toggleRecording();
     }
 
@@ -423,13 +431,52 @@
     const dist3 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
     const mean2 = (ps) => [0, 1].map((d) => ps.reduce((s, p) => s + p[d], 0) / ps.length);
     const cloneHands = (hs) => hs.map((h) => h.map((p) => [...p]));
+    function alignment(a, b, c) {   // cosine between a->b and b->c
+      const u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], v = [c[0] - b[0], c[1] - b[1], c[2] - b[2]];
+      return (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / Math.max(Math.hypot(...u) * Math.hypot(...v), 1e-9);
+    }
+    function palmFacing(w, a, b) {
+      const u = [a[0] - w[0], a[1] - w[1], a[2] - w[2]], v = [b[0] - w[0], b[1] - w[1], b[2] - w[2]];
+      const n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+      return Math.abs(n[2]) / Math.max(Math.hypot(n[0], n[1], n[2]), 1e-9);
+    }
+
+    // Where a point fixed to the palm has gone: the palm's landmarks are the steadiest part
+    // of the hand, so fit the 2D affine that carries their old positions onto their new
+    // ones and apply it to the point. An affine, not just a shift and turn, because a palm
+    // turning away from the camera foreshortens. The fit is pulled gently towards a plain
+    // rotate-and-scale so a palm seen edge-on, whose points nearly line up, can't blow it up.
+    const PALM_POINTS = [0, 5, 9, 13, 17];   // wrist and knuckles
+    function carry(from, to, p) {
+      const n = from.length, cf = mean2(from), ct = mean2(to);
+      let a = 0, b = 0, d = 0, e = 0, f = 0, g = 0, h = 0, nc = 0, ns = 0;
+      for (let i = 0; i < n; i++) {
+        const rx = from[i][0] - cf[0], ry = from[i][1] - cf[1], cx = to[i][0] - ct[0], cy = to[i][1] - ct[1];
+        a += rx * rx; b += rx * ry; d += ry * ry;
+        e += cx * rx; f += cx * ry; g += cy * rx; h += cy * ry;
+        nc += rx * cx + ry * cy; ns += rx * cy - ry * cx;
+      }
+      const den = Math.max(a + d, 1e-6), lam = 0.08 * den, sc = nc / den, ss = ns / den;
+      const p00 = e + lam * sc, p01 = f - lam * ss, p10 = g + lam * ss, p11 = h + lam * sc;
+      const m00 = a + lam, m11 = d + lam, det = Math.max(m00 * m11 - b * b, 1e-9);
+      const i00 = m11 / det, i01 = -b / det, i11 = m00 / det;
+      const dx = p[0] - cf[0], dy = p[1] - cf[1];
+      return [ct[0] + (p00 * i00 + p01 * i01) * dx + (p00 * i01 + p01 * i11) * dy,
+              ct[1] + (p10 * i00 + p11 * i01) * dx + (p10 * i01 + p11 * i11) * dy];
+    }
 
     // ================= Hand model =================
     // Each hand's five fingertips, smoothed on screen, plus its palm: the middle of the
-    // wrist and knuckles, which stays put while the fingers move. On top of plain smoothing:
-    //  - a fingertip that leaps relative to its wrist faster than a hand can move (usually
-    //    the tracker losing a hidden finger) is held back a couple of frames, riding along
-    //    with the wrist meanwhile, before the leap is believed;
+    // wrist and knuckles, which stays put while the fingers move. Smoothing can't fix a bad
+    // point (a sudden leap only makes it think the hand is moving fast and let the leap
+    // through), so bad points are caught first:
+    //  - a physical hand can't change sides, so each hand remembers which label the tracker
+    //    usually gives it. A frame that confidently calls it the other hand has probably
+    //    got the pose mirrored, which is by far the best warning of a bad frame there is;
+    //  - a fingertip that strays from where its palm says it should be is doubted too;
+    //  - a doubted fingertip rides along with the palm instead. It's only believed again
+    //    once it agrees with the palm, or holds steady for a few frames in a row, which a
+    //    point flickering between two guesses never does. Then it glides back, no jump.
     //  - a hand that drops out keeps moving with the other hand's palm (hands framing a
     //    portal mostly move together, shakes included), or drifts on and slows if both are
     //    gone. Following the palm, not the fingertips, means pinching or curling one hand
@@ -445,8 +492,12 @@
         this.palm = null;              // smoothed palm centre, px...
         this.vel = [0, 0];             // ...and its velocity, px/s
         this.lastPalm = null; this.lastVel = [0, 0];
-        this.offsets = null;           // raw fingertip offsets from the wrist, as last believed
-        this.doubt = [0, 0, 0, 0, 0];  // frames each fingertip's leap has been held back
+        this.good = [null, null, null, null, null];   // each fingertip as last believed, with the palm at the time
+        this.maybe = [null, null, null, null, null];  // a fingertip being doubted: where it claims to be, how long it's held
+        this.settle = [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]];   // what's left of each fingertip's glide
+        this.votes = { Left: 0, Right: 0 };           // which hand the tracker says this is, on balance
+        this.suspectSince = null;
+        this.suspect = false;
         this.drift = null;             // while coasting: where it started and how it's moving
         this.seenAt = -Infinity;       // ms
         this.t = 0;                    // s, last update
@@ -454,22 +505,54 @@
       }
       ready() { return !!this.tips; }
 
+      // Is this frame calling the hand the opposite of what it usually is?
+      checkLabel(h, now) {
+        const usual = this.votes.Left >= this.votes.Right ? "Left" : "Right";
+        const lead = Math.abs(this.votes.Left - this.votes.Right);
+        const against = h.label && h.label !== usual && h.labelScore > LABEL_DOUBT && lead > 3;
+        if (against && this.suspectSince === null) this.suspectSince = now;
+        if (!against) this.suspectSince = null;
+        const giveUp = against && now - this.suspectSince > DOUBT_MAX_MS;
+        if (h.label && (!against || giveUp)) {
+          this.votes[h.label] += h.labelScore;
+          this.votes.Left *= 0.995; this.votes.Right *= 0.995;
+        }
+        return against && !giveUp;
+      }
+
       observe(h, now) {
-        const t = now / 1000, s = REF_PALM / h.palm;
-        const frames = Math.max(1, (t - this.t) * 30);   // a slow camera allows a bigger leap per frame
-        if (!this.offsets) this.offsets = h.tips.map((p) => [p[0] - h.w[0], p[1] - h.w[1]]);
+        const t = now / 1000, s = REF_PALM / h.palm, dt = t - this.t;
+        const frames = Math.sqrt(Math.max(1, dt * 30));   // a slow camera allows a bigger leap per frame, but a glitch is no smaller for it
+        this.suspect = this.checkLabel(h, now);
+        const settleK = Math.exp(-Math.max(dt, 0) / SETTLE_TAU);
         const raw = h.tips.map((p, f) => {
-          const off = [p[0] - h.w[0], p[1] - h.w[1]], was = this.offsets[f];
-          if (dist(off, was) > TIP_JUMP * h.palm * frames && this.doubt[f] < TIP_DOUBT) {
-            this.doubt[f]++;
-            return [h.w[0] + was[0], h.w[1] + was[1]];
+          const was = this.good[f];
+          if (!was) { this.good[f] = { p, pts: h.pts }; return p; }
+          const expect = carry(was.pts, h.pts, was.p);
+          const stray = dist(p, expect) / h.palm;
+          if (stray <= (this.suspect ? 0.5 : 1) * TIP_JUMP * frames) {
+            this.good[f] = { p, pts: h.pts };
+            this.maybe[f] = null;
+            return p;
           }
-          this.doubt[f] = 0;
-          this.offsets[f] = off;
-          return p;
+          // Doubted. Has it at least been holding steady relative to the palm?
+          const m = this.maybe[f];
+          const steady = m && dist(p, carry(m.pts, h.pts, m.p)) / h.palm <= TIP_STEADY * frames;
+          const held = steady ? m.held + 1 : 1;
+          this.maybe[f] = { p, pts: h.pts, held };
+          if (!this.suspect && held > TIP_DOUBT) {
+            this.good[f] = { p, pts: h.pts };
+            this.maybe[f] = null;
+            this.settle[f] = [0, 1].map((d) => this.settle[f][d] + expect[d] - p[d]);
+            this.euro[f * 2].x = p[0]; this.euro[f * 2 + 1].x = p[1];
+            return p;
+          }
+          return expect;
         });
         const smooth = (p, i) => [this.euro[i * 2].filter(p[0], t, s), this.euro[i * 2 + 1].filter(p[1], t, s)];
-        this.tips = raw.map(smooth);
+        this.settle = this.settle.map((o) => o.map((v) => v * settleK));
+        this.tips = raw.map((p, f) => smooth(p, f).map((v, d) => v + this.settle[f][d]));
+        h.tips = raw;   // gestures get the checked points too
 
         const palm = smooth(h.center, 5);
         this.lastPalm = this.palm; this.lastVel = [...this.vel];   // as of last frame, for the other hand to line up with
@@ -516,56 +599,63 @@
     }
     const model = [new HandModel(), new HandModel()];   // [left, right] on screen
 
-    // Bands stack across the portal. Each hand's fingertips are sorted by where they sit
-    // across the line from one hand's fingertips to the other's, and paired in that order:
-    // top with top, next with next. Neighbouring bands then can't cross into bow-ties,
-    // whichever way either hand is turned, rolled or curled. That line only turns once it
-    // has drifted more than a few degrees (AXIS_SLACK), and then eases round (AXIS_TAU), so
-    // fingertip jitter, or pinching and curling one hand, doesn't swing it and shuffle the
-    // other hand's bands.
-    // Two fingertips at nearly the same height across the portal (fingers fanned out
-    // flat, or passing each other mid-twist) also share their position along it, so when
-    // they swap places their corners slide through the same spot instead of jumping from
-    // one finger to the other. A finger joining the portal grows out of the finger before
-    // it (and shrinks back into it when tucked), so bands open and close instead of
-    // popping. Returns the corners and which bands are open; the render loop smooths the
-    // corners once more (see cornerEuro).
+    // Bands stack across the portal: each hand's fingertips are ordered by where they sit
+    // across the line between the hands, and paired in that order, top with top, next with
+    // next, so neighbouring bands can't cross into bow-ties however either hand is turned.
+    // Corners sit exactly on the fingertips. The order is remembered, and two fingertips
+    // only trade places once one has clearly passed the other (SWAP_MARGIN), so fingers
+    // that sit level can't flicker back and forth; when they do trade, the corners glide
+    // across instead of jumping. A finger joining the portal grows out of the finger before
+    // it (and shrinks back into it when tucked), so bands open and close instead of popping.
+    // The line itself has no direction, so hands crossing over don't turn it end for end,
+    // and it's barely defined when the hands are close, so it stops turning as they meet.
     function portalHands([L, R], presence, dt) {
       const shown = [0, 1, 2, 3, 4].filter((f) => presence[f] > 0.001);
-      const place = (h) => shown.map((f) => {
+      const place = (h, f) => {
         if (presence[f] >= 1) return h[f];
         let a = f - 1;
         while (presence[a] < 1) a--;   // the nearest steady finger before it (index at worst)
         return [0, 1].map((d) => h[a][d] + (h[f][d] - h[a][d]) * presence[f]);
-      });
-      const [Lp, Rp] = [place(L), place(R)];
-      const [cl, cr] = [mean2(Lp), mean2(Rp)];
-      const want = Math.atan2(cr[1] - cl[1], cr[0] - cl[0]);
-      if (portalAngle === null) portalAngle = want;
-      const off = Math.atan2(Math.sin(want - portalAngle), Math.cos(want - portalAngle));
-      if (Math.abs(off) > AXIS_SLACK) portalAngle += (off - Math.sign(off) * AXIS_SLACK) * (1 - Math.exp(-dt / AXIS_TAU));
-      const u = [Math.cos(portalAngle), Math.sin(portalAngle)], v = [-u[1], u[0]];   // along, across
-      const blend = STACK_BLEND * lastPalm;
-      const stack = (ps, c) => {
-        const s = ps.map((p) => ({ along: (p[0] - c[0]) * u[0] + (p[1] - c[1]) * u[1], across: (p[0] - c[0]) * v[0] + (p[1] - c[1]) * v[1] }));
-        // Each corner sits at a fingertip's height across the portal; along it, it averages
-        // the fingertips near that height (just its own when the others are clear of it).
-        const alongAt = (b) => {
-          let sw = 0, sa = 0;
-          for (const p of s) { const w = Math.max(0, 1 - Math.abs(p.across - b) / blend); sw += w; sa += w * p.along; }
-          return sa / sw;
-        };
-        const pts = s.map((p) => p.across).sort((a, b) => a - b).map((b) => [0, 1].map((d) => c[d] + u[d] * alongAt(b) + v[d] * b));
-        return [0, 1, 2, 3, 4].map((i) => [...pts[Math.min(i, pts.length - 1)]]);   // pad to 5; extra bands stay closed
       };
-      return { pts: [stack(Lp, cl), stack(Rp, cr)], bands: [0, 1, 2, 3].map((k) => k < shown.length - 1) };
-    }
+      const spots = [L, R].map((h) => { const at = []; shown.forEach((f) => { at[f] = place(h, f); }); return at; });
+      const [cl, cr] = spots.map((at) => mean2(shown.map((f) => at[f])));
+      const want = Math.atan2(cr[1] - cl[1], cr[0] - cl[0]);
+      if (portalAngle === null) { portalAngle = want; stackOrder = [[], []]; }
+      const wrap = Math.atan2(Math.sin(want - portalAngle), Math.cos(want - portalAngle));
+      const off = wrap > Math.PI / 2 ? wrap - Math.PI : wrap < -Math.PI / 2 ? wrap + Math.PI : wrap;
+      const clear = Math.min(1, Math.max(0, (dist(cl, cr) / lastPalm - 0.6) / 0.8));   // 0 touching .. 1 well apart
+      if (Math.abs(off) > AXIS_SLACK) portalAngle += (off - Math.sign(off) * AXIS_SLACK) * (1 - Math.exp(-dt / AXIS_TAU)) * clear;
+      const v = [-Math.sin(portalAngle), Math.cos(portalAngle)];   // across
+      const fade = Math.exp(-dt / SWAP_TAU), margin = SWAP_MARGIN * lastPalm;
 
-    // The drawn corners get the fingertips' kind of smoothing too: firm when nearly still,
-    // light when moving fast. Where fingertips sit almost level, a tiny wobble in which
-    // one is higher shifts the shared corner further than the fingertips themselves move;
-    // this keeps that from showing as jiggle without slowing the portal down.
-    const cornerEuro = Array.from({ length: 20 }, () => new OneEuro(CORNER_CUTOFF, BETA, D_CUTOFF));   // 2 hands × 5 corners × x/y
+      const pts = spots.map((at, s) => {
+        const across = (f) => at[f][0] * v[0] + at[f][1] * v[1];
+        const was = stackOrder[s];
+        const glide = swapGlide[s];
+        glide.forEach((g) => { g[0] *= fade; g[1] *= fade; });
+        let order;
+        if (!was.length) order = [...shown].sort((a, b) => across(a) - across(b));
+        else {
+          order = was.filter((f) => presence[f] > 0.001);
+          for (const f of shown) if (!order.includes(f)) order.splice(order.indexOf(f - 1) + 1, 0, f);   // joins beside the finger it grows from
+          const same = order.length === was.length;
+          for (let pass = 0; pass < 4; pass++) for (let i = 0; i + 1 < order.length; i++) {
+            if (across(order[i]) - across(order[i + 1]) > margin) {
+              const a = order[i], b = order[i + 1];
+              if (same) for (let d = 0; d < 2; d++) {
+                const gap = at[a][d] - at[b][d];
+                glide[i][d] += gap; glide[i + 1][d] -= gap;
+              }
+              order[i] = b; order[i + 1] = a;
+            }
+          }
+        }
+        stackOrder[s] = order;
+        const corners = order.map((f, i) => [at[f][0] + glide[i][0], at[f][1] + glide[i][1]]);
+        return [0, 1, 2, 3, 4].map((i) => [...corners[Math.min(i, corners.length - 1)]]);   // pad to 5; extra bands stay closed
+      });
+      return { pts, bands: [0, 1, 2, 3].map((k) => k < shown.length - 1) };
+    }
 
     // Which detected hand is the left one and which the right. Normally that's screen
     // order, but if the other pairing carries on from the last frame much better (hands
@@ -602,10 +692,18 @@
         const wl = result.worldLandmarks?.[i];
         const at = wl ? (j) => [wl[j].x, wl[j].y, wl[j].z] : (j) => [...toPx(lm[j]), 0];
         const curls = FINGERS.map(([tip, mcp]) => dist3(at(tip), at(WRIST)) / Math.max(dist3(at(mcp), at(WRIST)), 1e-6));
+        // Bands go by which way each finger points compared with its palm. Reach (the curls
+        // above) can't: a curled finger the tracker can't see gets guessed as reaching far.
+        const reach = FINGERS.map(([tip, mcp]) => alignment(at(WRIST), at(mcp), at(tip)));
         const tips = TIPS.map((j) => toPx(lm[j]));
-        const center = mean2([WRIST, 5, MIDDLE_MCP, 13, 17].map((j) => toPx(lm[j])));   // wrist and knuckles
+        const pts = PALM_POINTS.map((j) => toPx(lm[j]));
+        const center = mean2(pts);
+        const side = (result.handedness || result.handednesses)?.[i]?.[0];
+        // How squarely the palm faces the camera: the plane through the wrist and two knuckles.
+        const facing = wl ? palmFacing(at(WRIST), at(5), at(17)) : 1;
         return {
-          w, palm, center, curls, tips,
+          w, palm, center, curls, reach, tips, pts, facing,
+          label: side?.categoryName, labelScore: side?.score ?? 0,
           fist: curls[0] < FIST_INDEX && curls.slice(1).every((c) => c < FIST_OTHERS),
         };
       });
@@ -613,6 +711,8 @@
       // ---- Which hand is which, then update each hand seen, then let a missing one coast.
       const slots = assignHands(info, now);
       handCurls = slots.map((h) => h && h.curls);
+      handReach = slots.map((h) => h && h.reach);
+      handFacing = slots.map((h) => h && h.facing);
       updateFists(slots, now);
       slots.forEach((h, s) => {
         if (!h) return;
@@ -637,7 +737,6 @@
         fingerOn = noFingers();
         fingerSince = [null, null, null, null, null];
         portalAngle = null;
-        cornerEuro.forEach((f) => f.reset());
         display = cloneHands(tracked);
       }
 
@@ -645,14 +744,19 @@
       // it's tucked on both, so pinching or curling one hand doesn't fold up the other
       // hand's bands. Either way it has to stay that way for a moment, so a twist or a
       // shake doesn't flick its band open and shut.
-      [L, R].forEach((h, s) => h.curls.forEach((c, f) => {
-        if (c > FINGER_OUT_AT) fingerOut[s][f] = true;
-        else if (c < FINGER_IN_AT) fingerOut[s][f] = false;
-      }));
+      const judged = [L, R].map((h, s) => h.facing >= BAND_FACING && !model[s].suspect);
+      [L, R].forEach((h, s) => {
+        if (!judged[s]) return;
+        h.reach.forEach((c, f) => {
+          if (c > FINGER_OUT_AT) fingerOut[s][f] = true;
+          else if (c < FINGER_IN_AT) fingerOut[s][f] = false;
+        });
+      });
       for (let f = 2; f < 5; f++) {
         const outOn = fingerOut.filter((out) => out[f - 1]).length;   // fingerOut runs index..pinky
         const want = fingerOn[f] ? outOn > 0 : outOn === 2;
-        if (want === fingerOn[f]) fingerSince[f] = null;
+        // A band only opens on what both hands show right now, never on a stale reading.
+        if (want === fingerOn[f] || (want && !(judged[0] && judged[1]))) fingerSince[f] = null;
         else if (fingerSince[f] === null) fingerSince[f] = now;
         else if (now - fingerSince[f] >= (want ? BAND_ON_MS : BAND_OFF_MS)) { fingerOn[f] = want; fingerSince[f] = null; }
       }
@@ -1267,8 +1371,8 @@
         return Math.abs(goal - eased) < 0.002 ? goal : eased;
       });
       if (display) {
-        const { pts, bands } = portalHands(display, presence, dt), t = now / 1000, s = REF_PALM / lastPalm;
-        livePts = pts.map((hand, h) => hand.map((p, i) => [0, 1].map((d) => cornerEuro[(h * 5 + i) * 2 + d].filter(p[d], t, s))));
+        const { pts, bands } = portalHands(display, presence, dt);
+        livePts = pts;
         liveBands = bands;
       }
       tune += (targetTune - tune) * (1 - Math.exp(-dt / TUNE_TAU));
@@ -1297,9 +1401,11 @@
         const bridging = active && now - lastBoth > 50;
         $("debug").textContent =
           `hands      ${handsSeen}${bridging ? "  (bridging one hand)" : ""}   fingers in portal ${fingerOn.map(Number).join(" ")}\n` +
-          `curls      ${handCurls.map((c) => (c ? c.map((v) => v.toFixed(2)).join(" ") : "–")).join("  |  ") || "–"}  (index..pinky, out > ${FINGER_OUT_AT}, in < ${FINGER_IN_AT})\n` +
+          `curls      ${handCurls.map((c) => (c ? c.map((v) => v.toFixed(2)).join(" ") : "–")).join("  |  ") || "–"}  (index..pinky)\n` +
+          `reach      ${handReach.map((c) => (c ? c.map((v) => v.toFixed(2)).join(" ") : "–")).join("  |  ") || "–"}  (out > ${FINGER_OUT_AT}, in < ${FINGER_IN_AT})\n` +
           `pinch      close ${close === null ? "–" : close.toFixed(2)}  (switch < ${CLOSE_AT}, re-arm > ${REOPEN_AT})  ${closed ? "closed" : "armed"}\n` +
           `fist       L ${fistNow[0] ? "yes" : "no"}  R ${fistNow[1] ? "yes" : "no"}${fistSince !== null ? `   both held ${Math.round(now - fistSince)} ms` : ""}   stamped ${stamp ? "yes" : "no"}\n` +
+          `trust      palm facing ${handFacing.map((v) => (v === null || v === undefined ? "–" : v.toFixed(2))).join(" | ")} (bands judged > ${BAND_FACING})   pose doubted ${model.map((m) => (m.suspect ? "YES" : "no")).join(" | ")}   points held ${model.map((m) => m.maybe.filter(Boolean).length).join(" | ")}\n` +
           `tilt       ${tiltDeg.toFixed(1)}°   tune ${tune.toFixed(2)}\n` +
           `tracking   ${detectFps} fps   camera ${vw}×${vh}   low-light boost ${boost >= 1.1 && canBoost ? "×" + boost.toFixed(1) : "off"}\n` +
           `record     ${recording ? `${recording.frames.length} frames (R to save)` : "press R to record what the tracker sees"}`;

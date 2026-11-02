@@ -182,14 +182,14 @@
     const FIST_RELEASE_MS = 150;
     const EXTENDED       = 1.30;  // a finger above this on each hand = clean portal pose (used for freezing)
 
-    // Bands: band k sits between finger k and k+1 (thumb–index, index–middle,
-    // middle–ring, ring–pinky) on both hands. Band 0 is the original portal and is
-    // always on; the others turn on when both of their fingers are out on both hands.
+    // Bands: thumb and index always make the portal; middle, ring and pinky join it when
+    // they're out on both hands, each adding a band (see portalHands for how they stack).
     const FINGER_OUT_AT = 1.30;   // same ratio as the fist check: above this a finger counts as out
     const FINGER_IN_AT  = 1.15;   // ...and below this it counts as tucked away again
-    const BAND_ON_MS    = 60;     // a band's fingers must agree this long before it appears...
-    const BAND_OFF_MS   = 200;    // ...and this long before it goes, so twists and shakes don't flicker it
+    const BAND_ON_MS    = 60;     // a finger must be out this long before its band opens...
+    const BAND_OFF_MS   = 300;    // ...and tucked this long before it closes, so twists and shakes don't flicker it
     const BAND_TAU      = 0.08;
+    const STACK_BLEND   = 0.3;    // palm lengths: fingertips closer than this across the portal start sharing a spot
 
     // Swipe
     const SWIPE_WINDOW_MS   = 300;
@@ -202,15 +202,14 @@
     const TILT_RANGE    = 30;
 
     // Tracking / smoothing
-    const BRIDGE_MS  = 400;   // keep the portal alive this long while one hand is missing (it coasts meanwhile)
+    const BRIDGE_MS  = 500;   // keep the portal alive this long while one hand is missing (it coasts meanwhile)
     const LOST_MS    = 150;
     const MIN_CUTOFF = 1.2;
-    const BETA       = 0.02;
+    const BETA       = 0.04;
     const REF_PALM   = 120;   // px. BETA is tuned for a hand this size; speeds are rescaled so near and far hands smooth alike
-    const TIP_JUMP   = 0.7;   // palm widths a fingertip may leap (relative to its palm) in one frame before it's doubted...
-    const TIP_DOUBT  = 3;     // ...for this many frames, after which the leap is believed
+    const TIP_JUMP   = 0.7;   // palm lengths a fingertip may leap (relative to its wrist) in one frame before it's doubted...
+    const TIP_DOUBT  = 2;     // ...for this many frames, after which the leap is believed
     const COAST_TAU  = 0.25;  // s: a hand that drops out keeps drifting, slowing with this time constant
-    const PALM_EAGER = 3;     // the palm's smoothing reacts to speed this many times more than a fingertip's
     const FADE_TAU   = 0.06;
     const TUNE_TAU   = 0.08;
     const TRANS_S    = 0.35;
@@ -224,7 +223,7 @@
     FILTERS.forEach(() => dotsEl.appendChild(document.createElement("span")));
 
     function showFilter() {
-      const bands = stamp ? stamp.bands : bandOn;
+      const bands = stamp ? stamp.bands : liveBands;
       const extra = bands.filter(Boolean).length - 1;
       const lit = bands.map((on, k) => (on ? (filterIdx + k) % FILTERS.length : -1));
       $("filterName").textContent = FILTERS[filterIdx] + (extra > 0 ? ` +${extra}` : "");
@@ -280,8 +279,11 @@
     // Bands
     const allTucked = () => [[false, false, false, false], [false, false, false, false]];
     let fingerOut = allTucked();  // [left, right] × [index, middle, ring, pinky]
-    let bandOn = [true, false, false, false], bandAlpha = [1, 0, 0, 0], shownBands = "";
-    let bandSince = [null, null, null, null];   // when each band's fingers started disagreeing with it
+    const noFingers = () => [true, true, false, false, false];
+    let fingerOn = noFingers();   // [thumb..pinky]: in the portal (thumb and index always)
+    let fingerSince = [null, null, null, null, null];   // when each finger started disagreeing with fingerOn
+    let presence = [1, 1, 0, 0, 0];   // eased fingerOn: a finger opening or closing its band
+    let livePts = null, liveBands = [true, false, false, false], shownBands = "";   // the live portal as drawn (see portalHands)
 
     // Swipe
     let swipeHistory = [], lastSwipe = -Infinity;
@@ -311,7 +313,33 @@
       if (e.key === "ArrowLeft") switchFilter(-1, [1, 0]);
       if (e.key === "f" || e.key === "F") stampRequest = true;
       if (e.key === "d" || e.key === "D") { showDebug = !showDebug; $("debug").hidden = !showDebug; }
+      if (e.key === "r" || e.key === "R") toggleRecording();
     });
+
+    // ================= Recording =================
+    // R records exactly what the hand tracker reports each frame; R again saves it as a
+    // JSON file. Replaying a recording reproduces a tracking glitch away from the camera.
+    const RECORD_MAX_FRAMES = 3600;   // about a minute at 60 fps
+    let recording = null;
+    function toggleRecording() {
+      if (!recording) {
+        recording = { video: [video.videoWidth, video.videoHeight], frames: [], started: performance.now() };
+        hudStatus("Recording hand tracking. Press R to stop and save.");
+        return;
+      }
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([JSON.stringify(recording)], { type: "application/json" }));
+      a.download = `hand-recording-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      recording = null;
+      hudStatus("");
+    }
+    function recordFrame(result, now) {
+      const pack = (hands) => (hands || []).map((lm) => lm.map((p) => [+p.x.toFixed(5), +p.y.toFixed(5), +p.z.toFixed(5)]));
+      recording.frames.push({ t: Math.round(now - recording.started), hands: pack(result.landmarks), world: pack(result.worldLandmarks) });
+      if (recording.frames.length >= RECORD_MAX_FRAMES) toggleRecording();
+    }
 
     // ================= One Euro filter =================
     class OneEuro {
@@ -381,131 +409,152 @@
       return boosted;
     }
 
-    const WRIST = 0, INDEX_MCP = 5, MIDDLE_MCP = 9, PINKY_MCP = 17;
+    const WRIST = 0, MIDDLE_MCP = 9;
     const TIPS = [4, 8, 12, 16, 20];   // thumb, index, middle, ring, pinky
     const THUMB = 0, INDEX = 1;        // positions in TIPS
     const FINGERS = [[8, 5], [12, 9], [16, 13], [20, 17]];
     const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
     const dist3 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
-    const sub3 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-    const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-    const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    const mean2 = (ps) => [0, 1].map((d) => ps.reduce((s, p) => s + p[d], 0) / ps.length);
     const cloneHands = (hs) => hs.map((h) => h.map((p) => [...p]));
 
     // ================= Hand model =================
-    // Each hand is a palm (wrist, index knuckle and pinky knuckle, in 3D) plus where each
-    // fingertip sits relative to it. The palm points are the steadiest ones MediaPipe
-    // gives, so the fingertips ride on the palm: shaking or twisting the hand moves the
-    // palm, while the fingertips' own, noisier motion is smoothed and sanity-checked
-    // separately. A hand that drops out for a moment keeps drifting the way it was going
-    // instead of stopping dead.
-    const PALM = [WRIST, INDEX_MCP, PINKY_MCP];
-
-    // The palm's axes: wrist→index knuckle, wrist→pinky knuckle and the palm's normal
-    // (scaled to match), so any point can be written as a mix of the three.
-    function palmAxes([o, i, p]) {
-      const a = sub3(i, o), b = sub3(p, o), c = cross(a, b);
-      const s = Math.hypot(...a) / Math.max(Math.hypot(...c), 1e-6);
-      return [o, a, b, c.map((v) => v * s)];
-    }
-
+    // Each hand's five fingertips, smoothed on screen. On top of plain smoothing:
+    //  - a fingertip that leaps relative to its wrist in one frame (usually the tracker
+    //    losing a hidden finger) is held back a couple of frames, riding along with the
+    //    wrist meanwhile, before the leap is believed;
+    //  - a hand that drops out keeps moving with the other hand (hands framing a portal
+    //    mostly move together, shakes included), or drifts on and slows if both are gone.
+    // Everything stays in 2D: MediaPipe's depth estimate is too noisy to build on.
     class HandModel {
       constructor() {
-        // Palm points jitter less than fingertips, so they can follow motion more eagerly;
-        // any lag here gets magnified out at the fingertips when the hand twists.
-        this.palmEuro = Array.from({ length: 9 }, () => new OneEuro(MIN_CUTOFF, BETA * PALM_EAGER));   // 3 points × x/y/z
-        this.tipEuro = Array.from({ length: 15 }, () => new OneEuro(MIN_CUTOFF, BETA));   // 5 tips × 3 axes
+        this.euro = Array.from({ length: 10 }, () => new OneEuro(MIN_CUTOFF, BETA));   // 5 tips × x/y
         this.reset();
       }
       reset() {
-        this.palm = null;              // smoothed palm points, 3D px
-        this.local = null;             // smoothed fingertips in the palm's axes
+        this.tips = null;              // smoothed fingertips, px
+        this.wrist = null;             // raw wrist, px
+        this.offsets = null;           // raw fingertip offsets from the wrist, as last believed
         this.doubt = [0, 0, 0, 0, 0];  // frames each fingertip's leap has been held back
-        this.vel = [0, 0, 0];          // wrist velocity, px/s
-        this.lastWrist = null; this.lastVel = [0, 0, 0];
+        this.center = null;            // middle of the smoothed fingertips...
+        this.vel = [0, 0];             // ...and its velocity, px/s
+        this.lastCenter = null; this.lastVel = [0, 0];
         this.drift = null;             // while coasting: where it started and how it's moving
         this.seenAt = -Infinity;       // ms
         this.t = 0;                    // s, last update
-        [...this.palmEuro, ...this.tipEuro].forEach((f) => f.reset());
+        this.euro.forEach((f) => f.reset());
       }
-      ready() { return !!(this.palm && this.local); }
+      ready() { return !!this.tips; }
 
-      // pts: all 21 landmarks in 3D px. palmLen: wrist to middle knuckle.
-      observe(pts, palmLen, now) {
-        const t = now / 1000, s = REF_PALM / palmLen;
-        const before = this.palm && this.palm[0];
-        this.lastWrist = before; this.lastVel = [...this.vel];   // as of last frame, for the other hand to line up with
-        this.palm = PALM.map((j, n) => pts[j].map((v, d) => this.palmEuro[n * 3 + d].filter(v, t, s)));
-        if (before && t > this.t) {
+      observe(h, now) {
+        const t = now / 1000, s = REF_PALM / h.palm;
+        if (!this.offsets) this.offsets = h.tips.map((p) => [p[0] - h.w[0], p[1] - h.w[1]]);
+        const raw = h.tips.map((p, f) => {
+          const off = [p[0] - h.w[0], p[1] - h.w[1]], was = this.offsets[f];
+          if (dist(off, was) > TIP_JUMP * h.palm && this.doubt[f] < TIP_DOUBT) {
+            this.doubt[f]++;
+            return [h.w[0] + was[0], h.w[1] + was[1]];
+          }
+          this.doubt[f] = 0;
+          this.offsets[f] = off;
+          return p;
+        });
+        this.tips = raw.map((p, f) => [this.euro[f * 2].filter(p[0], t, s), this.euro[f * 2 + 1].filter(p[1], t, s)]);
+        this.wrist = [...h.w];
+
+        const c = mean2(this.tips);
+        this.lastCenter = this.center; this.lastVel = [...this.vel];   // as of last frame, for the other hand to line up with
+        if (this.center && t > this.t) {
           const k = 1 - Math.exp(-(t - this.t) / 0.05);
-          this.vel = this.vel.map((v, d) => v + ((this.palm[0][d] - before[d]) / (t - this.t) - v) * k);
+          this.vel = this.vel.map((v, d) => v + ((c[d] - this.center[d]) / (t - this.t) - v) * k);
         }
-
-        // Fingertips in the raw palm's axes: only the fingers' own movement is left.
-        const [o, a, b, n] = palmAxes(PALM.map((j) => pts[j]));
-        const bn = cross(b, n), na = cross(n, a), ab = cross(a, b), det = dot3(a, bn);
-        if (Math.abs(det) > 1e-6) {
-          const raw = TIPS.map((j) => {
-            const d = sub3(pts[j], o);
-            return [dot3(bn, d) / det, dot3(na, d) / det, dot3(ab, d) / det];
-          });
-          if (!this.local) this.local = raw.map((l) => [...l]);
-          raw.forEach((l, f) => {
-            // A fingertip that leaps across the hand in one frame is usually the tracker
-            // losing a hidden finger: hold it back a few frames before believing it.
-            if (dist3(l, this.local[f]) > TIP_JUMP && this.doubt[f] < TIP_DOUBT) { this.doubt[f]++; return; }
-            this.doubt[f] = 0;
-            this.local[f] = l.map((v, d) => this.tipEuro[f * 3 + d].filter(v, t, REF_PALM));
-          });
-        }
+        this.center = c;
         this.seenAt = now; this.t = t; this.drift = null;
       }
 
       // Not seen this frame: keep the hand's shape and let it drift on. While the other
-      // hand is in view this one moves with it (hands framing a portal mostly move
-      // together, shakes included), and only the difference between the two hands'
-      // speeds fades out. With neither in view it just drifts on, slowing down.
+      // hand is in view this one moves with it, and only the difference between the two
+      // hands' speeds fades out. With neither in view it just drifts on, slowing down.
       coast(now, partner) {
         const t = now / 1000, dt = t - this.t;
-        if (!this.palm || dt <= 0) return;
+        if (!this.tips || dt <= 0) return;
         this.t = t;
         const withPartner = partner.seenAt === now;
         if (!this.drift || this.drift.withPartner !== withPartner) {
           // Compare against the other hand as of last frame, when this one was last placed.
           this.drift = {
             withPartner,
-            palm: this.palm.map((p) => [...p]),
-            from: withPartner ? [...(partner.lastWrist || partner.palm[0])] : null,
+            tips: this.tips.map((p) => [...p]),
+            wrist: [...this.wrist],
+            from: withPartner ? [...(partner.lastCenter || partner.center)] : null,
             rel: this.vel.map((v, d) => v - (withPartner ? partner.lastVel[d] : 0)),
-            own: [0, 0, 0],
+            own: [0, 0],
           };
         }
         const c = this.drift;
         c.own = c.own.map((m, d) => m + c.rel[d] * dt);
         c.rel = c.rel.map((v) => v * Math.exp(-dt / COAST_TAU));
-        const shared = withPartner ? partner.palm[0].map((v, d) => v - c.from[d]) : [0, 0, 0];
-        this.palm = c.palm.map((p, n) => p.map((v, d) => {
+        const shared = withPartner ? [0, 1].map((d) => partner.center[d] - c.from[d]) : [0, 0];
+        this.tips = c.tips.map((p, f) => p.map((v, d) => {
           const moved = v + shared[d] + c.own[d];
-          this.palmEuro[n * 3 + d].shift(moved);
+          this.euro[f * 2 + d].shift(moved);
           return moved;
         }));
-      }
-
-      // Fingertips on screen, 2D px.
-      tips() {
-        const [o, a, b, n] = palmAxes(this.palm);
-        return this.local.map(([x, y, z]) => [0, 1].map((d) => o[d] + x * a[d] + y * b[d] + z * n[d]));
+        this.wrist = c.wrist.map((v, d) => v + shared[d] + c.own[d]);
+        this.center = mean2(this.tips);
       }
     }
     const model = [new HandModel(), new HandModel()];   // [left, right] on screen
+
+    // Bands stack across the portal. Each hand's fingertips are sorted by where they sit
+    // across the line from one hand's fingertips to the other's, and paired in that
+    // order: top with top, next with next. Neighbouring bands then can't cross into
+    // bow-ties, whichever way either hand is turned, rolled or curled. When the fingertips
+    // come within a palm of each other (or interlock) that line gets shaky, so it leans
+    // on the line between the wrists instead, which stay apart.
+    // Two fingertips at nearly the same height across the portal (fingers fanned out
+    // flat, or passing each other mid-twist) also share their position along it, so when
+    // they swap places their corners slide through the same spot instead of jumping from
+    // one finger to the other. A finger joining the portal grows out of the finger before
+    // it (and shrinks back into it when tucked), so bands open and close instead of
+    // popping. Returns the corners as drawn and which bands are open.
+    function portalHands([L, R], [wl, wr], presence) {
+      const shown = [0, 1, 2, 3, 4].filter((f) => presence[f] > 0.001);
+      const place = (h) => shown.map((f) => {
+        if (presence[f] >= 1) return h[f];
+        let a = f - 1;
+        while (presence[a] < 1) a--;   // the nearest steady finger before it (index at worst)
+        return [0, 1].map((d) => h[a][d] + (h[f][d] - h[a][d]) * presence[f]);
+      });
+      const [Lp, Rp] = [place(L), place(R)];
+      const [cl, cr] = [mean2(Lp), mean2(Rp)];
+      const gap = Math.hypot(cr[0] - cl[0], cr[1] - cl[1]);
+      const wristLen = Math.hypot(wr[0] - wl[0], wr[1] - wl[1]) || 1, lean = Math.max(0, lastPalm - gap);
+      const dir = [0, 1].map((d) => cr[d] - cl[d] + (wr[d] - wl[d]) / wristLen * lean);
+      const len = Math.hypot(dir[0], dir[1]) || 1;
+      const u = [dir[0] / len, dir[1] / len], v = [-u[1], u[0]];   // along, across
+      const blend = STACK_BLEND * lastPalm;
+      const stack = (ps, c) => {
+        const s = ps.map((p) => ({ along: (p[0] - c[0]) * u[0] + (p[1] - c[1]) * u[1], across: (p[0] - c[0]) * v[0] + (p[1] - c[1]) * v[1] }));
+        // Each corner sits at a fingertip's height across the portal; along it, it averages
+        // the fingertips near that height (just its own when the others are clear of it).
+        const alongAt = (b) => {
+          let sw = 0, sa = 0;
+          for (const p of s) { const w = Math.max(0, 1 - Math.abs(p.across - b) / blend); sw += w; sa += w * p.along; }
+          return sa / sw;
+        };
+        const pts = s.map((p) => p.across).sort((a, b) => a - b).map((b) => [0, 1].map((d) => c[d] + u[d] * alongAt(b) + v[d] * b));
+        return [0, 1, 2, 3, 4].map((i) => [...pts[Math.min(i, pts.length - 1)]]);   // pad to 5; extra bands stay closed
+      };
+      return { pts: [stack(Lp, cl), stack(Rp, cr)], bands: [0, 1, 2, 3].map((k) => k < shown.length - 1) };
+    }
 
     // Which detected hand is the left one and which the right. Normally that's screen
     // order, but if the other pairing carries on from the last frame much better (hands
     // crossing or touching), that wins. A lone hand goes to whichever side it continues.
     function assignHands(info, now) {
       const known = tracked && now - lastAny < BRIDGE_MS;
-      const cost = (h, s) =>
-        (dist(h.w, model[s].palm[0]) + h.tips.reduce((sum, p, f) => sum + dist(p, tracked[s][f]), 0)) / 6 / h.palm;
+      const cost = (h, s) => h.tips.reduce((sum, p, f) => sum + dist(p, tracked[s][f]), 0) / 5 / h.palm;
       if (info.length === 2) {
         let [A, B] = info[0].w[0] <= info[1].w[0] ? info : [info[1], info[0]];
         if (known && cost(A, 1) + cost(B, 0) < 0.7 * (cost(A, 0) + cost(B, 1))) [A, B] = [B, A];
@@ -527,10 +576,9 @@
 
       const info = hands.map((lm, i) => {
         const w = toPx(lm[WRIST]);
-        const pts = lm.map(toPx3);
         // Palm length in 3D, so it doesn't shrink (and inflate every gesture distance)
         // when the hand turns away from the camera.
-        const palm = Math.max(dist3(pts[WRIST], pts[MIDDLE_MCP]), 1);
+        const palm = Math.max(dist3(toPx3(lm[WRIST]), toPx3(lm[MIDDLE_MCP])), 1);
         // Curls from the metric world landmarks: a finger pointing at the camera or at
         // the other hand looks short in 2D but not in 3D. Falls back to 2D without them.
         const wl = result.worldLandmarks?.[i];
@@ -538,7 +586,7 @@
         const curls = FINGERS.map(([tip, mcp]) => dist3(at(tip), at(WRIST)) / Math.max(dist3(at(mcp), at(WRIST)), 1e-6));
         const tips = TIPS.map((j) => toPx(lm[j]));
         return {
-          w, palm, curls, pts, tips,
+          w, palm, curls, tips,
           fist: curls[0] < FIST_INDEX && curls.slice(1).every((c) => c < FIST_OTHERS),
         };
       });
@@ -550,10 +598,10 @@
       slots.forEach((h, s) => {
         if (!h) return;
         if (now - model[s].seenAt > BRIDGE_MS) model[s].reset();   // back after a while: start fresh
-        model[s].observe(h.pts, h.palm, now);
+        model[s].observe(h, now);
       });
       slots.forEach((h, s) => { if (!h) model[s].coast(now, model[1 - s]); });
-      if (model[0].ready() && model[1].ready()) tracked = model.map((m) => m.tips());
+      if (model[0].ready() && model[1].ready()) tracked = model.map((m) => m.tips.map((p) => [...p]));
 
       const [L, R] = slots;
       if (L || R) lastAny = now;
@@ -567,22 +615,22 @@
       if (now - lastBoth > BRIDGE_MS || !display) {   // both hands back after a while
         swipeHistory = [];
         fingerOut = allTucked();
-        bandOn = [true, false, false, false];
-        bandSince = [null, null, null, null];
+        fingerOn = noFingers();
+        fingerSince = [null, null, null, null, null];
         display = cloneHands(tracked);
       }
 
-      // ---- Bands: each needs both of its fingers out on both hands, and has to stay
-      // that way for a moment, so a twist or a shake doesn't flick it on and off.
+      // ---- Bands: a finger joins the portal once it's out on both hands, and has to stay
+      // that way for a moment, so a twist or a shake doesn't flick its band open and shut.
       [L, R].forEach((h, s) => h.curls.forEach((c, f) => {
         if (c > FINGER_OUT_AT) fingerOut[s][f] = true;
         else if (c < FINGER_IN_AT) fingerOut[s][f] = false;
       }));
-      for (let k = 1; k < 4; k++) {
-        const want = fingerOut.every((out) => out[k - 1] && out[k]);
-        if (want === bandOn[k]) bandSince[k] = null;
-        else if (bandSince[k] === null) bandSince[k] = now;
-        else if (now - bandSince[k] >= (want ? BAND_ON_MS : BAND_OFF_MS)) { bandOn[k] = want; bandSince[k] = null; }
+      for (let f = 2; f < 5; f++) {
+        const want = fingerOut.every((out) => out[f - 1]);   // fingerOut runs index..pinky
+        if (want === fingerOn[f]) fingerSince[f] = null;
+        else if (fingerSince[f] === null) fingerSince[f] = now;
+        else if (now - fingerSince[f] >= (want ? BAND_ON_MS : BAND_OFF_MS)) { fingerOn[f] = want; fingerSince[f] = null; }
       }
 
       const wasLost = inLoss, lossDur = now - lossStart;
@@ -595,7 +643,7 @@
       const width  = (dist(Lt[INDEX], Rt[INDEX]) + dist(Lt[THUMB], Rt[THUMB])) / 2 / palm;
       const height = (dist(Lt[INDEX], Lt[THUMB]) + dist(Rt[INDEX], Rt[THUMB])) / 2 / palm;
       prevClose = close;
-      close = bandOn.some((on, k) => on && k > 0) ? width : Math.max(width, height);
+      close = fingerOn.slice(2).some(Boolean) ? width : Math.max(width, height);
       closeAt = now;
       const cx = (Lt[INDEX][0] + Lt[THUMB][0] + Rt[INDEX][0] + Rt[THUMB][0]) / 4;
       const cy = (Lt[INDEX][1] + Lt[THUMB][1] + Rt[INDEX][1] + Rt[THUMB][1]) / 4;
@@ -1102,9 +1150,9 @@
         [stampTex, snapTex] = [snapTex, stampTex];
         stamp = { pts: goodPts, bands: goodBands, tune: goodTune };
         goodPts = null;     // that snapshot belongs to the stamp now
-      } else if (display && now - lastAny < 500) {
+      } else if (livePts && now - lastAny < 500) {
         copyVideoTo(stampTex, vw, vh);
-        stamp = { pts: cloneHands(display), bands: [...bandOn], tune };
+        stamp = { pts: cloneHands(livePts), bands: [...liveBands], tune };
       } else {
         return;
       }
@@ -1173,7 +1221,11 @@
 
       if (landmarker && video.currentTime !== lastVideoTime) {
         lastVideoTime = video.currentTime;
-        try { trackHands(landmarker.detectForVideo(detectionInput(now, vw, vh), now), vw, vh, now); }
+        try {
+          const result = landmarker.detectForVideo(detectionInput(now, vw, vh), now);
+          if (recording) recordFrame(result, now);
+          trackHands(result, vw, vh, now);
+        }
         catch (e) { console.error(e); }
         detectCount++;
       }
@@ -1193,7 +1245,11 @@
         }));
       }
       const kb = 1 - Math.exp(-dt / BAND_TAU);
-      bandAlpha = bandAlpha.map((a, k) => a + ((bandOn[k] ? 1 : 0) - a) * kb);
+      presence = presence.map((p, f) => {
+        const goal = fingerOn[f] ? 1 : 0, eased = p + (goal - p) * kb;
+        return Math.abs(goal - eased) < 0.002 ? goal : eased;
+      });
+      if (display) ({ pts: livePts, bands: liveBands } = portalHands(display, model.map((m) => m.wrist), presence));
       tune += (targetTune - tune) * (1 - Math.exp(-dt / TUNE_TAU));
       // The live portal is hidden while stamped, and stays hidden until the fist that
       // released the stamp opens again, so it doesn't reappear crumpled.
@@ -1202,14 +1258,14 @@
 
       if (active && poseGood && display) {
         copyVideoTo(snapTex, vw, vh);
-        goodPts = cloneHands(display);
-        goodBands = [...bandOn];
+        goodPts = cloneHands(livePts);
+        goodBands = [...liveBands];
         goodAt = now;
         goodTune = tune;
       }
       if (stampRequest) { stampRequest = false; toggleStamp(now, vw, vh); }
 
-      const bandsKey = (stamp ? stamp.bands : bandOn).join();
+      const bandsKey = (stamp ? stamp.bands : liveBands).join();
       if (bandsKey !== shownBands) { shownBands = bandsKey; showFilter(); }
 
       const shownTune = stamp ? stamp.tune : tune;
@@ -1219,12 +1275,13 @@
       if (showDebug) {
         const bridging = active && now - lastBoth > 50;
         $("debug").textContent =
-          `hands      ${handsSeen}${bridging ? "  (bridging one hand)" : ""}   bands ${bandOn.map(Number).join(" ")}\n` +
+          `hands      ${handsSeen}${bridging ? "  (bridging one hand)" : ""}   fingers in portal ${fingerOn.map(Number).join(" ")}\n` +
           `curls      ${handCurls.map((c) => (c ? c.map((v) => v.toFixed(2)).join(" ") : "–")).join("  |  ") || "–"}  (index..pinky, out > ${FINGER_OUT_AT}, in < ${FINGER_IN_AT})\n` +
           `pinch      close ${close === null ? "–" : close.toFixed(2)}  (switch < ${CLOSE_AT}, re-arm > ${REOPEN_AT})  ${closed ? "closed" : "armed"}\n` +
           `fist       L ${fistNow[0] ? "yes" : "no"}  R ${fistNow[1] ? "yes" : "no"}${fistSince !== null ? `   both held ${Math.round(now - fistSince)} ms` : ""}   stamped ${stamp ? "yes" : "no"}\n` +
           `tilt       ${tiltDeg.toFixed(1)}°   tune ${tune.toFixed(2)}\n` +
-          `tracking   ${detectFps} fps   camera ${vw}×${vh}   low-light boost ${boost >= 1.1 && canBoost ? "×" + boost.toFixed(1) : "off"}`;
+          `tracking   ${detectFps} fps   camera ${vw}×${vh}   low-light boost ${boost >= 1.1 && canBoost ? "×" + boost.toFixed(1) : "off"}\n` +
+          `record     ${recording ? `${recording.frames.length} frames (R to save)` : "press R to record what the tracker sees"}`;
       }
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -1254,7 +1311,7 @@
       gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(gl.TEXTURE_2D, stampTex);
       if (stamp) drawPortal(stamp.pts, view, { bands: stamp.bands.map(Number), alpha: 1, tune: stamp.tune, stamp: true });
-      if (display && portalAlpha > 0.001) drawPortal(display, view, { bands: bandAlpha, alpha: portalAlpha, tune, stamp: false });
+      if (livePts && portalAlpha > 0.001) drawPortal(livePts, view, { bands: liveBands.map(Number), alpha: portalAlpha, tune, stamp: false });
       gl.disable(gl.SCISSOR_TEST);
       gl.disable(gl.BLEND);
     }

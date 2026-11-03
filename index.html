@@ -206,9 +206,15 @@
     const TILT_DEADZONE = 5;
     const TILT_RANGE    = 30;
 
+    // Low light: average picture brightness (0..1) below which the tracker gets help
+    const CLEAN_LIGHT = 0.55;   // soften sensor grain below this
+    const DIM_LIGHT   = 0.30;   // ...lift the shadows once below this
+    const DARK_LIGHT  = 0.11;   // ...and twice below this
+    const SOFTEN_BLUR = 0.0012; // blur radius as a fraction of the frame's width (1.5 px at 1280)
+
     // Tracking / smoothing
-    const BRIDGE_MS  = 500;   // keep the portal alive this long while one hand is missing (it coasts meanwhile)
-    const LOST_MS    = 150;
+    const BRIDGE_MS  = 500;   // keep the portal alive this long while one hand is missing (it coasts meanwhile)...
+    const LOST_MS    = 150;   // ...and this long with both missing. Both stretch for slow cameras (see lostMs, bridgeMs)
     const MIN_CUTOFF = 0.8;
     const BETA       = 0.04;
     const D_CUTOFF   = 3.0;   // Hz: how quickly the smoothing notices a change of speed
@@ -223,6 +229,12 @@
     const FADE_TAU   = 0.06;
     const TUNE_TAU   = 0.08;
     const TRANS_S    = 0.35;
+
+    // Dim rooms slow webcams down, and at 10 fps a single missed frame is already 200 ms.
+    // These waits are at least a few frames long, whatever the camera's frame rate.
+    let frameGap = 33, lastDetect = 0;   // ms between camera frames, on average
+    const lostMs = () => Math.max(LOST_MS, 2.5 * frameGap);
+    const bridgeMs = () => Math.max(BRIDGE_MS, 5 * frameGap);
 
     const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
     const $ = (id) => document.getElementById(id);
@@ -305,8 +317,8 @@
     // Tilt
     let tiltDeg = 0, targetTune = 0.5, tune = 0.5;
 
-    // Low-light boost for the tracker
-    let boost = 1, lastMeter = -Infinity;
+    // Low-light clean-up for the tracker
+    let soften = false, lift = 0, lastMeter = -Infinity;
 
     // Debug
     let showDebug = false, detectCount = 0, detectFps = 30, fpsWindowStart = 0;
@@ -396,15 +408,18 @@
     }
     const landmarkerPromise = createLandmarker();
 
-    // Dim, cheap webcams are the main cause of lost hands. Measure brightness twice a
-    // second and, if the room is dark, feed the tracker a brightened copy of the frame.
-    // (Only the tracker sees this; the picture on screen is unchanged.)
+    // In a dim room a webcam either stays dark or turns its gain up, and either way the
+    // picture fills with grain. Grain is what stops the tracker finding hands, so simply
+    // brightening the frame makes things worse. Instead: soften the grain first, then lift
+    // the shadows (a "screen" blend, which brightens dark areas without blowing out bright
+    // ones). Brightness is measured twice a second, with a little slack so it doesn't dither
+    // between settings. Only the tracker sees this; the picture on screen is unchanged.
     const meter = document.createElement("canvas");
     meter.width = 32; meter.height = 18;
     const meterCtx = meter.getContext("2d", { willReadFrequently: true });
-    const boosted = document.createElement("canvas");
-    const boostedCtx = boosted.getContext("2d");
-    const canBoost = typeof boostedCtx.filter === "string";
+    const cleaned = document.createElement("canvas");
+    const cleanedCtx = cleaned.getContext("2d");
+    const canBlur = typeof cleanedCtx.filter === "string";   // browsers without canvas filters shrink the frame instead
 
     function detectionInput(now, vw, vh) {
       if (now - lastMeter > 500) {
@@ -414,14 +429,21 @@
         let s = 0;
         for (let i = 0; i < d.length; i += 4) s += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
         const avg = s / (d.length / 4) / 255;
-        const target = Math.min(2.5, Math.max(1, 0.45 / Math.max(avg, 0.02)));
-        boost += (target - boost) * 0.5;
+        soften = avg < (soften ? CLEAN_LIGHT + 0.05 : CLEAN_LIGHT);
+        lift = avg < (lift === 2 ? DARK_LIGHT + 0.02 : DARK_LIGHT) ? 2 : avg < (lift >= 1 ? DIM_LIGHT + 0.03 : DIM_LIGHT) ? 1 : 0;
       }
-      if (!canBoost || boost < 1.1) return video;
-      if (boosted.width !== vw || boosted.height !== vh) { boosted.width = vw; boosted.height = vh; }
-      boostedCtx.filter = `brightness(${boost.toFixed(2)}) contrast(1.15)`;
-      boostedCtx.drawImage(video, 0, 0, vw, vh);
-      return boosted;
+      if (!soften) return video;
+      const w = canBlur ? vw : vw >> 1, h = canBlur ? vh : vh >> 1;
+      if (cleaned.width !== w || cleaned.height !== h) { cleaned.width = w; cleaned.height = h; }
+      const ctx = cleanedCtx;
+      ctx.globalCompositeOperation = "source-over";
+      if (canBlur) ctx.filter = `blur(${(vw * SOFTEN_BLUR).toFixed(2)}px)`;
+      ctx.drawImage(video, 0, 0, w, h);
+      if (canBlur) ctx.filter = "none";
+      ctx.globalCompositeOperation = "screen";
+      for (let i = 0; i < lift; i++) ctx.drawImage(cleaned, 0, 0);
+      ctx.globalCompositeOperation = "source-over";
+      return cleaned;
     }
 
     const WRIST = 0, MIDDLE_MCP = 9;
@@ -651,7 +673,7 @@
     // order, but if the other pairing carries on from the last frame much better (hands
     // crossing or touching), that wins. A lone hand goes to whichever side it continues.
     function assignHands(info, now) {
-      const known = tracked && now - lastAny < BRIDGE_MS;
+      const known = tracked && now - lastAny < bridgeMs();
       const cost = (h, s) => h.tips.reduce((sum, p, f) => sum + dist(p, tracked[s][f]), 0) / 5 / h.palm;
       if (info.length === 2) {
         let [A, B] = info[0].w[0] <= info[1].w[0] ? info : [info[1], info[0]];
@@ -706,7 +728,7 @@
       updateFists(slots, now);
       slots.forEach((h, s) => {
         if (!h) return;
-        if (now - model[s].seenAt > BRIDGE_MS) model[s].reset();   // back after a while: start fresh
+        if (now - model[s].seenAt > bridgeMs()) model[s].reset();   // back after a while: start fresh
         model[s].observe(h, now);
       });
       slots.forEach((h, s) => { if (!h) model[s].coast(now, model[1 - s]); });
@@ -721,7 +743,7 @@
       }
 
       const palm = (L.palm + R.palm) / 2;
-      if (now - lastBoth > BRIDGE_MS || !display) {   // both hands back after a while
+      if (now - lastBoth > bridgeMs() || !display) {   // both hands back after a while
         swipeHistory = [];
         fingerOut = allTucked();
         fingerOn = noFingers();
@@ -1338,6 +1360,8 @@
 
       if (landmarker && video.currentTime !== lastVideoTime) {
         lastVideoTime = video.currentTime;
+        if (lastDetect) frameGap += (Math.min(now - lastDetect, 1500) - frameGap) * 0.2;
+        lastDetect = now;
         try {
           const result = landmarker.detectForVideo(detectionInput(now, vw, vh), now);
           if (recording) recordFrame(result, now);
@@ -1348,7 +1372,7 @@
       }
       if (now - fpsWindowStart > 1000) { detectFps = Math.max(detectCount, 1); detectCount = 0; fpsWindowStart = now; }
 
-      const active = tracked && now - lastAny < LOST_MS && now - lastBoth < BRIDGE_MS;
+      const active = tracked && now - lastAny < lostMs() && now - lastBoth < bridgeMs();
       if (!active && now - lastAny > 500) targetTune = 0.5;
 
       // The portal moves with each new camera frame, the same moment the video does. Easing
@@ -1397,7 +1421,7 @@
           `fist       L ${fistNow[0] ? "yes" : "no"}  R ${fistNow[1] ? "yes" : "no"}${fistSince !== null ? `   both held ${Math.round(now - fistSince)} ms` : ""}   stamped ${stamp ? "yes" : "no"}\n` +
           `trust      palm facing ${handFacing.map((v) => (v === null || v === undefined ? "–" : v.toFixed(2))).join(" | ")} (bands judged > ${BAND_FACING})   pose doubted ${model.map((m) => (m.suspect ? "YES" : "no")).join(" | ")}   points held ${model.map((m) => m.maybe.filter(Boolean).length).join(" | ")}\n` +
           `tilt       ${tiltDeg.toFixed(1)}°   tune ${tune.toFixed(2)}\n` +
-          `tracking   ${detectFps} fps   camera ${vw}×${vh}   low-light boost ${boost >= 1.1 && canBoost ? "×" + boost.toFixed(1) : "off"}\n` +
+          `tracking   ${detectFps} fps   camera ${vw}×${vh}   low light ${soften ? (lift ? `grain softened, shadows lifted ×${lift}` : "grain softened") : "off"}\n` +
           `record     ${recording ? `${recording.frames.length} frames (R to save)` : "press R to record what the tracker sees"}`;
       }
 
